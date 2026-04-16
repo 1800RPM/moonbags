@@ -14,6 +14,23 @@ const execFileAsync = promisify(execFile);
 
 const CHAIN = "solana";
 const CLI_TIMEOUT_MS = 12_000;
+const CLI_MAX_CONCURRENCY = 3;
+
+let activeCliCalls = 0;
+const cliQueue: Array<() => void> = [];
+
+async function withCliSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeCliCalls >= CLI_MAX_CONCURRENCY) {
+    await new Promise<void>((resolve) => cliQueue.push(resolve));
+  }
+  activeCliCalls++;
+  try {
+    return await fn();
+  } finally {
+    activeCliCalls--;
+    cliQueue.shift()?.();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tiny TTL cache
@@ -40,10 +57,12 @@ function cacheSet<T>(key: string, value: T): void {
 // ---------------------------------------------------------------------------
 async function runCli<T>(args: string[]): Promise<T | null> {
   try {
-    const { stdout } = await execFileAsync("onchainos", args, {
-      timeout: CLI_TIMEOUT_MS,
-      env: onchainosEnv(),
-    });
+    const { stdout } = await withCliSlot(() =>
+      execFileAsync("onchainos", args, {
+        timeout: CLI_TIMEOUT_MS,
+        env: onchainosEnv(),
+      }),
+    );
     const json = JSON.parse(stdout) as { ok: boolean; data?: T };
     if (!json.ok) {
       logger.warn({ args: args.join(" ") }, "[okx] response not-ok");
@@ -51,7 +70,7 @@ async function runCli<T>(args: string[]): Promise<T | null> {
     }
     return json.data ?? null;
   } catch (err) {
-    logger.warn({ err: (err as Error).message, args: args.join(" ") }, "[okx] cli failed");
+    logger.warn({ ...describeCliError(err), args: args.join(" ") }, "[okx] cli failed");
     return null;
   }
 }
@@ -64,6 +83,32 @@ function onchainosEnv(): NodeJS.ProcessEnv {
     env.OKX_PASSPHRASE = env.OKX_API_PASSPHRASE;
   }
   return env;
+}
+
+function describeCliError(err: unknown): Record<string, unknown> {
+  const e = err as Error & {
+    code?: number | string;
+    signal?: string;
+    stdout?: string | Buffer;
+    stderr?: string | Buffer;
+  };
+  const stdout = String(e.stdout ?? "");
+  const stderr = String(e.stderr ?? "");
+  let okxError: unknown;
+  try {
+    const parsed = JSON.parse(stdout) as { error?: unknown; msg?: unknown; code?: unknown };
+    okxError = parsed.error ?? parsed.msg ?? parsed.code;
+  } catch {
+    okxError = undefined;
+  }
+  return {
+    err: e.message,
+    code: e.code,
+    signal: e.signal,
+    okxError,
+    stdout: stdout.slice(0, 500),
+    stderr: stderr.slice(0, 500),
+  };
 }
 
 // ---------------------------------------------------------------------------
