@@ -40,12 +40,13 @@ Use at your own risk.
 8. [Running the bot](#running-the-bot)
 9. [Telegram commands](#telegram-commands)
 10. [LLM exit advisor](#llm-exit-advisor)
-11. [Web dashboard](#web-dashboard)
-12. [State files](#state-files)
-13. [Operating day-to-day](#operating-day-to-day)
-14. [Backtesting](#backtesting)
-15. [Troubleshooting](#troubleshooting)
-16. [Safety notes](#safety-notes)
+11. [Milestone alerts](#milestone-alerts)
+12. [Web dashboard](#web-dashboard)
+13. [State files](#state-files)
+14. [Operating day-to-day](#operating-day-to-day)
+15. [Backtesting](#backtesting)
+16. [Troubleshooting](#troubleshooting)
+17. [Safety notes](#safety-notes)
 
 ---
 
@@ -75,7 +76,8 @@ If you want to see the signal quality firsthand, follow [@scg_alpha](https://x.c
    - **Static trail/stop logic** (default) — sells when price drops X% from the peak after arming, or hits the hard stop.
    - **LLM advisor** (optional) — every 30s after arming, sends an on-chain snapshot to MiniMax M2.7 which decides `hold` / `tighten_trail` / `exit_now` based on smart money flow, dev wallet activity, holder PnL, momentum, etc.
 6. **Notifies** every buy, arm, sell, and LLM decision to your Telegram chat.
-7. **Persists** all state to disk so a restart picks up where it left off.
+7. **Milestone alerts** — when a position crosses a PnL threshold you configured (default +100%, +200%, +500%, +1000%), fires a Telegram message with a one-tap sell button.
+8. **Persists** all state to disk so a restart picks up where it left off.
 
 ---
 
@@ -337,6 +339,12 @@ TELEGRAM_CHAT_ID=518183629
 # === LLM EXIT ADVISOR ===
 LLM_EXIT_ENABLED=false         # true to let MiniMax manage exits
 MINIMAX_API_KEY=               # required when LLM_EXIT_ENABLED=true
+
+# === MILESTONE ALERTS ===
+# Send a Telegram notification (with inline sell button) the first time a
+# position crosses each PnL threshold. Edit live via /settings, no restart.
+MILESTONES_ENABLED=true
+MILESTONE_PCTS=100,200,500,1000  # comma-separated % thresholds (2x/3x/6x/11x)
 ```
 
 **Security note:** `.env` should never be committed. Add it to `.gitignore` (already present in this repo).
@@ -446,7 +454,8 @@ Sent to your Telegram chat as events happen. Dedupe is built in so you don't get
 - `🟢 BUY` — every buy (mcap, spent, tx link)
 - `⚡ ARMED` — when a position hits `ARM_PCT` and trailing activates
 - `🤖 LLM watching` — fires **once per position** when the LLM advisor first picks it up
-- `🤖 LLM tightened 55% → 25%` — only when the LLM actually changes the trail (≥1% delta)
+- `🤖 LLM tightened 55% → 25%` / `🤖 LLM loosened 25% → 55%` — only when the LLM actually changes the trail (≥1% delta), direction-aware copy
+- `🚀 / 🌙 / 💎 / 👑 <TOKEN> hit +100%` — **milestone alerts** with an inline sell button when a position crosses each configured PnL % (fires once per threshold). Tap the button to close in one tap.
 - `🟢 SELL` — every close, with reason + PnL. Includes the LLM's reasoning when it triggered the exit.
 - `❌ BUY FAILED` — when a swap couldn't land
 - `🚨 SELL STUCK` — after 10 sell retries failed (needs manual action)
@@ -459,7 +468,9 @@ Sent to your Telegram chat as events happen. Dedupe is built in so you don't get
 - `TRAIL_PCT` — drawdown from peak that triggers exit
 - `STOP_PCT` — hard stop loss
 - `MAX_HOLD_SECS` — time-based exit
-- `LLM_EXIT_ENABLED` — toggle LLM advisor
+- `LLM_EXIT_ENABLED` — toggle LLM advisor on/off
+- `MILESTONES_ENABLED` — toggle milestone PnL alerts on/off
+- `MILESTONE_PCTS` — comma-separated PnL % thresholds, e.g. `100,200,500,1000`
 
 **NOT editable from Telegram (security boundary):**
 
@@ -518,6 +529,43 @@ Polling cost: ~120 LLM calls per armed position per hour. The Starter plan (1500
 ### Safety net
 
 The hard stop (`STOP_PCT`) is **always active** regardless of LLM state. If MiniMax goes down or returns garbage, the bot falls back to the existing trail logic. The LLM never gets to override the floor.
+
+---
+
+## Milestone alerts
+
+When a position's PnL crosses a threshold you configured, a Telegram message fires with an **inline sell button** — one tap to take profit without opening `/positions`.
+
+**Defaults:** `100, 200, 500, 1000` — meaning +100% (🚀 2x), +200% (🌙 3x), +500% (💎 6x), +1000% (👑 11x).
+
+### How it works
+
+- Every 3-second tick, after PnL is computed, the bot checks whether the current PnL just crossed any threshold in `MILESTONE_PCTS`.
+- The first time a position crosses a given threshold, a notification fires. Each threshold fires **at most once per position** (dedupe via `position.milestonesHit[]`, persisted across restarts).
+- The inline button uses the same `sell:<mint>` callback as the sell buttons in `/positions`, so tapping it works instantly.
+
+### Sample notification
+
+```
+🌙 ALLIN hit +200%  (3.0x)
+Now: +214.3%  |  Peak: +241.7%
+Unrealized: +0.0426 SOL
+
+[ 🚨 Sell ALLIN ]
+```
+
+Tier icons: 🚀 for 2x, 🌙 for 3x, 💎 for 5-9x, 👑 for 10x+.
+
+### Configuration
+
+Both knobs editable live via `/settings` in Telegram:
+
+| Setting | Description |
+|---------|-------------|
+| `MILESTONES_ENABLED` | Feature toggle (default ON) |
+| `MILESTONE_PCTS` | Comma-separated % thresholds, e.g. `100,200,500,1000`. Max 10 values. |
+
+Changes take effect on the next tick — no restart needed.
 
 ---
 
