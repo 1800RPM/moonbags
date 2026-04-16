@@ -36,7 +36,7 @@ function str(name: string): string | undefined {
 
 /**
  * Parse a comma-separated list of positive numbers from an env var.
- * E.g. "100,200,500,1000" → [100, 200, 500, 1000].
+ * E.g. "100,200,500,1000" -> [100, 200, 500, 1000].
  * Invalid values are dropped silently; returns `fallback` on fully empty/invalid input.
  */
 function numList(name: string, fallback: number[]): number[] {
@@ -65,15 +65,15 @@ if (!PRIV_B58) missing.push("PRIV_B58");
 
 if (missing.length > 0) {
   if (DRY_RUN && missing.length === 1 && missing[0] === "PRIV_B58") {
-    console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
+    console.warn("[config] DRY_RUN=true and PRIV_B58 missing - continuing without a signing key.");
   } else if (DRY_RUN && missing.every((m) => m === "PRIV_B58")) {
-    console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
+    console.warn("[config] DRY_RUN=true and PRIV_B58 missing - continuing without a signing key.");
   } else {
     const hardMissing = missing.filter((m) => !(DRY_RUN && m === "PRIV_B58"));
     if (hardMissing.length > 0) {
       throw new Error(`Missing required env vars: ${hardMissing.join(", ")}`);
     } else {
-      console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
+      console.warn("[config] DRY_RUN=true and PRIV_B58 missing - continuing without a signing key.");
     }
   }
 }
@@ -111,7 +111,9 @@ export const CONFIG = ({
   TELEGRAM_CHAT_ID: str("TELEGRAM_CHAT_ID") ?? "",
   LLM_EXIT_ENABLED: bool("LLM_EXIT_ENABLED", false),
   MINIMAX_API_KEY: str("MINIMAX_API_KEY") ?? "",
-  // Milestone alerts — when a position crosses one of these PnL % thresholds
+  OPENROUTER_API_KEY: str("OPENROUTER_API_KEY") ?? "",
+  OPENROUTER_MODEL: str("OPENROUTER_MODEL") ?? "openai/gpt-4.1-mini",
+  // Milestone alerts - when a position crosses one of these PnL % thresholds
   // on its way up, send a Telegram notification with a force-sell button.
   // Default [100, 200, 500, 1000] = 2x / 3x / 6x / 11x.
   MILESTONES_ENABLED: bool("MILESTONES_ENABLED", true),
@@ -123,7 +125,7 @@ export type Config = typeof CONFIG;
 
 // ---------------------------------------------------------------------------
 // Runtime config editing (used by Telegram /settings menu).
-// Only whitelisted keys can be modified at runtime — API keys, wallet keys,
+// Only whitelisted keys can be modified at runtime - API keys, wallet keys,
 // RPC URLs, and DRY_RUN are intentionally excluded from live editing.
 // ---------------------------------------------------------------------------
 export type SettableKey =
@@ -149,7 +151,7 @@ type Spec = {
 export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
   BUY_SIZE_SOL: {
     type: "number",
-    validate: (v) => (typeof v === "number" && v >= 0.001 && v <= 1.0 ? null : "must be 0.001 – 1.0 SOL"),
+    validate: (v) => (typeof v === "number" && v >= 0.001 && v <= 1.0 ? null : "must be 0.001 - 1.0 SOL"),
     display: (v) => `${(v as number).toString()} SOL`,
   },
   MAX_CONCURRENT_POSITIONS: {
@@ -157,31 +159,31 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
     validate: (v) =>
       typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 50
         ? null
-        : "must be an integer 1 – 50",
+        : "must be an integer 1 - 50",
     display: (v) => `${v}`,
   },
   ARM_PCT: {
     type: "number",
-    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 – 5.0 (5% – 500%)"),
+    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 - 5.0 (5% - 500%)"),
     display: (v) => `${((v as number) * 100).toFixed(0)}%`,
   },
   TRAIL_PCT: {
     type: "number",
-    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 – 5.0 (5% – 500%)"),
+    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 - 5.0 (5% - 500%)"),
     display: (v) => `${((v as number) * 100).toFixed(0)}%`,
   },
   STOP_PCT: {
     type: "number",
-    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 – 5.0 (5% – 500%)"),
+    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 5.0 ? null : "must be 0.05 - 5.0 (5% - 500%)"),
     display: (v) => `${((v as number) * 100).toFixed(0)}%`,
   },
   MAX_HOLD_SECS: {
     type: "number",
     validate: (v) =>
-      typeof v === "number" && Number.isFinite(v) && v >= 60 ? null : "must be ≥ 60 seconds",
+      typeof v === "number" && Number.isFinite(v) && v >= 60 ? null : "must be >= 60 seconds",
     display: (v) => {
       const n = v as number;
-      if (n >= 99_999_999) return "∞";
+      if (n >= 99_999_999) return "inf";
       if (n >= 86400) return `${(n / 86400).toFixed(1)}d`;
       if (n >= 3600) return `${(n / 3600).toFixed(1)}h`;
       if (n >= 60) return `${Math.round(n / 60)}m`;
@@ -191,12 +193,12 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
   LLM_EXIT_ENABLED: {
     type: "boolean",
     validate: (v) => (typeof v === "boolean" ? null : "must be true/false"),
-    display: (v) => (v ? "🤖 ON" : "⚪️ OFF"),
+    display: (v) => (v ? "ON" : "OFF"),
   },
   MILESTONES_ENABLED: {
     type: "boolean",
     validate: (v) => (typeof v === "boolean" ? null : "must be true/false"),
-    display: (v) => (v ? "🎯 ON" : "⚪️ OFF"),
+    display: (v) => (v ? "ON" : "OFF"),
   },
   MILESTONE_PCTS: {
     type: "numlist",
@@ -205,7 +207,7 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
       if (v.length === 0) return "at least one milestone required";
       if (v.length > 10) return "max 10 milestones";
       if (v.some((n) => typeof n !== "number" || !Number.isFinite(n) || n <= 0 || n > 100000)) {
-        return "each milestone must be a positive number (1 – 100000)";
+        return "each milestone must be a positive number (1 - 100000)";
       }
       return null;
     },
@@ -248,7 +250,7 @@ export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
     else if (["0", "false", "no", "n", "off"].includes(v)) parsed = false;
     else return { ok: false, error: "must be true/false" };
   } else {
-    // numlist — comma-separated positive numbers
+    // numlist - comma-separated positive numbers
     const parts = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
     if (parts.length === 0) return { ok: false, error: "no valid numbers in list" };
     parsed = parts.sort((a, b) => a - b);

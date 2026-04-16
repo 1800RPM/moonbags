@@ -38,10 +38,15 @@ async function main(): Promise<void> {
   // LLM exit advisor — interval always runs; the gate is inside tickLlmAdvisor()
   // so /llm can toggle at runtime without a restart.
   if (CONFIG.LLM_EXIT_ENABLED) {
-    if (!CONFIG.MINIMAX_API_KEY) {
+    const provider = CONFIG.OPENROUTER_API_KEY
+      ? `OpenRouter (${CONFIG.OPENROUTER_MODEL})`
+      : CONFIG.MINIMAX_API_KEY
+        ? "MiniMax (MiniMax-M2.7)"
+        : null;
+    if (!provider) {
       logger.warn("[llm] LLM_EXIT_ENABLED=true but MINIMAX_API_KEY is empty — advisor will skip every position");
     } else {
-      logger.info("[llm] exit advisor active (polling every 30s for armed positions)");
+      logger.info({ provider }, "[llm] exit advisor active (polling every 30s for armed positions)");
     }
   }
   const llmInterval: NodeJS.Timeout = setInterval(() => {
