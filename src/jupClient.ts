@@ -306,7 +306,8 @@ async function buyOnce(
 export async function buyTokenWithSol(
   mint: string,
   solLamports: bigint,
-): Promise<{ signature: string; tokensReceivedRaw: bigint; tokenDecimals: number } | null> {
+): Promise<{ signature: string; tokensReceivedRaw: bigint; tokenDecimals: number } | { error: string } | null> {
+  let lastError: string | null = null;
   for (let attempt = 1; attempt <= BUY_MAX_ATTEMPTS; attempt++) {
     try {
       const result = await buyOnce(mint, solLamports);
@@ -314,16 +315,18 @@ export async function buyTokenWithSol(
         if (attempt > 1) logger.info({ mint, attempt }, "buyTokenWithSol succeeded after retries");
         return result;
       }
+      lastError = "buyOnce returned no result";
     } catch (err) {
       const msg = (err as Error).message;
+      lastError = msg;
       logger.warn({ mint, attempt, maxAttempts: BUY_MAX_ATTEMPTS, err: msg }, "buyTokenWithSol attempt failed, retrying");
     }
     if (attempt < BUY_MAX_ATTEMPTS) {
       await new Promise((r) => setTimeout(r, BUY_RETRY_MS));
     }
   }
-  logger.error({ mint, attempts: BUY_MAX_ATTEMPTS }, "buyTokenWithSol failed permanently after all retries");
-  return null;
+  logger.error({ mint, attempts: BUY_MAX_ATTEMPTS, err: lastError }, "buyTokenWithSol failed permanently after all retries");
+  return { error: lastError ?? "unknown error" };
 }
 
 export async function sellTokenForSol(

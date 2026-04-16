@@ -138,11 +138,43 @@ export function notifyMoonbagStart(args: {
   );
 }
 
-export function notifyBuyFail(args: { name: string; mint: string; attempts: number }): Promise<void> {
+export function notifyBuyFail(args: { name: string; mint: string; attempts: number; reason?: string }): Promise<void> {
+  const reason = (args.reason ?? "").trim();
+  const shortReason = summarizeBuyFailReason(reason);
   return send(
     `❌ <b>BUY FAILED ${escapeHtml(args.name)}</b>\n` +
+    (shortReason ? `${escapeHtml(shortReason)}\n` : "") +
     `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>`,
   );
+}
+
+function summarizeBuyFailReason(reason: string): string {
+  if (!reason) return "";
+
+  if (reason.startsWith("jup getOrder returned empty/invalid transaction field")) {
+    return "Jupiter returned a quote but no executable transaction.";
+  }
+
+  const getOrderHttp = reason.match(/^jup getOrder (\d{3})\s*:/);
+  if (getOrderHttp) {
+    return `Jupiter order request failed (HTTP ${getOrderHttp[1]}).`;
+  }
+
+  const executeHttp = reason.match(/^jup executeOrder (\d{3})\s*:/);
+  if (executeHttp) {
+    return `Jupiter execute request failed (HTTP ${executeHttp[1]}).`;
+  }
+
+  if (reason.startsWith("execute non-success")) {
+    return "Jupiter execution returned non-success.";
+  }
+
+  if (reason === "buyOnce returned no result") {
+    return "Buy could not be completed after retries.";
+  }
+
+  const compact = reason.split("\n")[0]!.trim();
+  return compact.length > 140 ? `${compact.slice(0, 137)}...` : compact;
 }
 
 export function notifySellFail(args: {

@@ -278,12 +278,13 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
   const solLamports = BigInt(Math.floor(CONFIG.BUY_SIZE_SOL * 1_000_000_000));
 
   const buyResult = await buyTokenWithSol(alert.mint, solLamports);
-  if (!buyResult) {
+  if (!buyResult || "error" in buyResult) {
+    const error = !buyResult ? "unknown error" : buyResult.error;
     placeholder.status = "failed";
     placeholder.exitReason = "error";
     markDirty();
-    logger.error({ mint: alert.mint, name: alert.name }, "buyTokenWithSol failed");
-    void notifyBuyFail({ name: alert.name, mint: alert.mint, attempts: 1 });
+    logger.error({ mint: alert.mint, name: alert.name, err: error }, "buyTokenWithSol failed");
+    void notifyBuyFail({ name: alert.name, mint: alert.mint, attempts: 1, reason: error });
     scheduleCleanup(alert.mint);
     return null;
   }
