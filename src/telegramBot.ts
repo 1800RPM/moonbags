@@ -456,7 +456,7 @@ async function handleLlm(chatId: number): Promise<void> {
     return;
   }
   const now = CONFIG.LLM_EXIT_ENABLED;
-  const keySet = Boolean(CONFIG.OPENROUTER_API_KEY || CONFIG.MINIMAX_API_KEY);
+  const keySet = Boolean(CONFIG.MINIMAX_API_KEY);
   await tgPost("sendMessage", {
     chat_id: chatId,
     text:
