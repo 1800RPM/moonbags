@@ -1161,7 +1161,7 @@ export function startTelegramBot(): () => void {
       { command: "mint",      description: "On-demand on-chain snapshot of any token" },
       { command: "wallet",    description: "Show wallet address + SOL balance" },
       { command: "backtest",        description: "Run simple backtest (ARM × TRAIL × STOP) + adopt live" },
-      { command: "backtest_hybrid", description: "Run hybrid backtest (adds moonbag grid) + adopt live" },
+      { command: "backtest_hybrid", description: "Run hybrid backtest (adds moonbag grid — only fires when LLM mode is OFF)" },
       { command: "doctor",    description: "Run setup and runtime health checks" },
       { command: "setup_status", description: "Show setup checklist" },
       { command: "update",    description: "Pull latest code and restart via pm2" },
