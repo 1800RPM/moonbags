@@ -68,7 +68,7 @@ export type LlmContext = {
 // ---------------------------------------------------------------------------
 const MINIMAX_ENDPOINT = "https://api.minimax.io/v1/chat/completions";
 const MINIMAX_MODEL = "MiniMax-M2.7";
-const HTTP_TIMEOUT_MS = 15_000;
+const HTTP_TIMEOUT_MS = 20_000;
 const MAX_OUTPUT_TOKENS = 2000;
 
 // ---------------------------------------------------------------------------
