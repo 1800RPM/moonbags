@@ -454,7 +454,7 @@ MILESTONE_PCTS=100,200,500,1000  # comma-separated % thresholds (2x/3x/6x/11x)
 ### Dev mode (recommended for first run)
 
 ```bash
-DRY_RUN=true npx tsx src/main.ts
+DRY_RUN=true npm run start
 ```
 
 In dry-run, the bot fetches alerts and prices but **does not submit any swap transactions**. Watch the logs to verify everything is wired correctly.
@@ -465,7 +465,7 @@ In dry-run, the bot fetches alerts and prices but **does not submit any swap tra
 2. Make sure your wallet has enough SOL (at least 10× your `BUY_SIZE_SOL` plus ~0.01 SOL for fees).
 3. Run:
    ```bash
-   npx tsx src/main.ts
+   npm run start
    ```
 
 ### Production (long-running)
@@ -475,7 +475,7 @@ Use a process manager so the bot survives crashes:
 **Option A — `pm2`:**
 ```bash
 npm install -g pm2
-pm2 start "npx tsx src/main.ts" --name moonbags
+pm2 start "npm run start" --name moonbags
 pm2 logs moonbags
 pm2 save           # persist across reboot
 pm2 startup        # follow instructions to enable on boot
@@ -492,7 +492,7 @@ After=network.target
 Type=simple
 User=youruser
 WorkingDirectory=/path/to/moonbags
-ExecStart=/usr/bin/env npx tsx src/main.ts
+ExecStart=/usr/bin/env npm run start
 Restart=on-failure
 RestartSec=5
 
