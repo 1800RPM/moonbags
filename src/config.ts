@@ -1,10 +1,6 @@
 import dotenv from "dotenv";
-import { readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
 
 dotenv.config();
-
-const ENV_FILE = path.resolve(".env");
 
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
 export const JUP_BASE = "https://api.jup.ag/ultra/v1";
@@ -80,22 +76,21 @@ if (missing.length > 0) {
 
 // CONFIG is mutable so /settings in the Telegram bot can update values live.
 // API keys, wallet keys, and DRY_RUN are still NOT mutable via the in-process
-// updater (see SETTABLE_KEYS below). Direct file edits + restart are required
-// for those.
+// updater (see SETTABLE_KEYS below). Trading edits are persisted by settingsStore.
 export const CONFIG = ({
   JUP_API_KEY: JUP_API_KEY ?? "",
   HELIUS_API_KEY: HELIUS_API_KEY ?? "",
   PRIV_B58: PRIV_B58 ?? "",
   RPC_URL: resolveRpcUrl(),
-  BUY_SIZE_SOL: num("BUY_SIZE_SOL", 0.01),
-  MAX_CONCURRENT_POSITIONS: num("MAX_CONCURRENT_POSITIONS", 3),
+  BUY_SIZE_SOL: num("BUY_SIZE_SOL", 0.02),
+  MAX_CONCURRENT_POSITIONS: num("MAX_CONCURRENT_POSITIONS", 10),
   ARM_PCT: num("ARM_PCT", 0.5),
-  TRAIL_PCT: num("TRAIL_PCT", 0.2),
-  STOP_PCT: num("STOP_PCT", 0.3),
-  MAX_HOLD_SECS: num("MAX_HOLD_SECS", 1800),
-  MAX_ALERT_AGE_MINS: num("MAX_ALERT_AGE_MINS", 5),
-  MIN_LIQUIDITY_USD: num("MIN_LIQUIDITY_USD", 5000),
-  MIN_SCORE: num("MIN_SCORE", 75),
+  TRAIL_PCT: num("TRAIL_PCT", 0.55),
+  STOP_PCT: num("STOP_PCT", 0.4),
+  MAX_HOLD_SECS: num("MAX_HOLD_SECS", 99_999_999_999_999_999),
+  MAX_ALERT_AGE_MINS: num("MAX_ALERT_AGE_MINS", 0),
+  MIN_LIQUIDITY_USD: num("MIN_LIQUIDITY_USD", 0),
+  MIN_SCORE: num("MIN_SCORE", 0),
   MAX_RUG_RATIO: num("MAX_RUG_RATIO", 0),
   MAX_BUNDLER_PCT: num("MAX_BUNDLER_PCT", 0),
   MAX_TOP10_PCT: num("MAX_TOP10_PCT", 0),
@@ -110,6 +105,7 @@ export const CONFIG = ({
   TELEGRAM_BOT_TOKEN: str("TELEGRAM_BOT_TOKEN") ?? "",
   TELEGRAM_CHAT_ID: str("TELEGRAM_CHAT_ID") ?? "",
   LLM_EXIT_ENABLED: bool("LLM_EXIT_ENABLED", false),
+  LLM_POLL_MS: num("LLM_POLL_MS", 30_000),
   MINIMAX_API_KEY: str("MINIMAX_API_KEY") ?? "",
   // Milestone alerts — when a position crosses one of these PnL % thresholds
   // on its way up, send a Telegram notification with a force-sell button.
@@ -135,7 +131,11 @@ export type SettableKey =
   | "MAX_HOLD_SECS"
   | "LLM_EXIT_ENABLED"
   | "MILESTONES_ENABLED"
-  | "MILESTONE_PCTS";
+  | "MILESTONE_PCTS"
+  | "MOONBAG_PCT"
+  | "MB_TRAIL_PCT"
+  | "MB_TIMEOUT_SECS"
+  | "LLM_POLL_MS";
 
 export type SettableValue = number | boolean | number[];
 
@@ -214,26 +214,45 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
       return arr.map((n) => `+${n}%`).join(", ");
     },
   },
+  // Moonbag (partial kept after trail fires) — only active when LLM_EXIT_ENABLED=false.
+  // When LLM is on, partial exits are driven by the advisor's `partial_exit` action.
+  MOONBAG_PCT: {
+    type: "number",
+    validate: (v) => (typeof v === "number" && v >= 0 && v <= 0.9 ? null : "must be 0 – 0.9 (fraction kept, 0 = disabled)"),
+    display: (v) => (v === 0 ? "off" : `${((v as number) * 100).toFixed(0)}%`),
+  },
+  MB_TRAIL_PCT: {
+    type: "number",
+    validate: (v) => (typeof v === "number" && v >= 0.05 && v <= 0.95 ? null : "must be 0.05 – 0.95"),
+    display: (v) => `${((v as number) * 100).toFixed(0)}%`,
+  },
+  MB_TIMEOUT_SECS: {
+    type: "number",
+    validate: (v) =>
+      typeof v === "number" && Number.isFinite(v) && v >= 60 && v <= 86400
+        ? null
+        : "must be 60 – 86400 seconds",
+    display: (v) => {
+      const n = v as number;
+      if (n >= 3600) return `${(n / 3600).toFixed(1)}h`;
+      return `${Math.round(n / 60)}m`;
+    },
+  },
+  LLM_POLL_MS: {
+    type: "number",
+    validate: (v) =>
+      typeof v === "number" && Number.isFinite(v) && v >= 5_000 && v <= 300_000
+        ? null
+        : "must be 5000 – 300000 ms (5s – 5min)",
+    display: (v) => {
+      const n = v as number;
+      if (n >= 60_000) return `${(n / 60_000).toFixed(1)}m`;
+      return `${Math.round(n / 1000)}s`;
+    },
+  },
 };
 
 export type SetConfigResult = { ok: true } | { ok: false; error: string };
-
-function persistEnv(key: string, value: string): void {
-  let content: string;
-  try {
-    content = readFileSync(ENV_FILE, "utf8");
-  } catch {
-    content = "";
-  }
-  const line = `${key}=${value}`;
-  const re = new RegExp(`^${key}=.*$`, "m");
-  if (re.test(content)) {
-    content = content.replace(re, line);
-  } else {
-    content = content.endsWith("\n") || content === "" ? content + line + "\n" : content + "\n" + line + "\n";
-  }
-  writeFileSync(ENV_FILE, content);
-}
 
 export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   const spec = SETTABLE_SPECS[key];
@@ -258,13 +277,6 @@ export function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
 
   // mutate in-memory CONFIG (typed as readonly but the object isn't frozen anymore)
   (CONFIG as unknown as Record<string, unknown>)[key] = parsed;
-  // persist to .env so the change survives restart
-  try {
-    const envValue = Array.isArray(parsed) ? parsed.join(",") : String(parsed);
-    persistEnv(key, envValue);
-  } catch (e) {
-    return { ok: false, error: `wrote in-memory but .env persist failed: ${(e as Error).message}` };
-  }
   return { ok: true };
 }
 
