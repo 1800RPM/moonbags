@@ -1841,6 +1841,8 @@ export function startTelegramBot(): () => void {
       { command: "start",     description: "MoonBags dashboard" },
       { command: "positions", description: "Open positions + force-sell buttons" },
       { command: "pnl",       description: "Today's PnL + all-time stats" },
+      { command: "stats",     description: "Signal stats by mcap tier + adopt best range filter" },
+      { command: "mcapfilter", description: "Set MCap entry filter (e.g. /mcapfilter 50000 200000 or off)" },
       { command: "history",   description: "Last N closed trades (default 10)" },
       { command: "settings",  description: "Edit trading params live (no restart)" },
       { command: "llm",       description: "Toggle the LLM exit advisor on/off" },
