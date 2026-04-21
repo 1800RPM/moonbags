@@ -1,6 +1,6 @@
 import { CONFIG, SETTABLE_SPECS, setConfigValue as setConfigValueRaw, toggleConfigValue as toggleConfigValueRaw, type SetConfigResult, type SettableKey } from "./config.js";
 import logger from "./logger.js";
-import { getPositions, forceClosePosition, getStats, getClosedTrades, type ClosedTrade } from "./positionManager.js";
+import { getPositions, forceClosePosition, getStats, getClosedTrades, getSignalStats, type ClosedTrade } from "./positionManager.js";
 import { getWalletSolBalance, getWalletAddress } from "./jupClient.js";
 import {
   isPaused,
@@ -35,6 +35,7 @@ import {
   setExitStrategy,
   setTpTargets,
   syncRuntimeSettingsFromConfig,
+  updateRuntimeSettings,
   type ExitStrategyMode,
 } from "./settingsStore.js";
 
@@ -439,6 +440,21 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   if (!chatId) return;
   const data = cq.data ?? "";
 
+  if (data.startsWith("stats_adopt:")) {
+    const parts = data.split(":");
+    const mcapMin = Number(parts[1] ?? 0);
+    const mcapMax = Number(parts[2] ?? 0);
+    updateRuntimeSettings((draft) => {
+      draft.alertFilter.mcapMin = mcapMin;
+      draft.alertFilter.mcapMax = mcapMax;
+    });
+    const msg = (mcapMin === 0 && mcapMax === 0)
+      ? "Filter cleared — all mcap alerts allowed."
+      : `Filter set: ${fmtMcap(mcapMin)} – ${mcapMax > 0 ? fmtMcap(mcapMax) : "∞"}`;
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `✅ ${msg}`, show_alert: true });
+    return;
+  }
+
   if (data.startsWith("sell:")) {
     const mint = data.slice(5);
     const result = await forceClosePosition(mint);
@@ -827,6 +843,84 @@ function summarizePnl(trades: ClosedTrade[]): { pnlSol: number; wins: number; lo
   return { pnlSol, wins, losses, best, worst };
 }
 
+// ---------------------------------------------------------------------------
+// /stats — signal metadata distribution + best mcap range
+// ---------------------------------------------------------------------------
+function fmtMcap(n: number): string {
+  if (n === 0) return "$0";
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}k`;
+  return `$${n.toFixed(0)}`;
+}
+
+async function handleStats(chatId: number): Promise<void> {
+  const stats = await getSignalStats();
+
+  if (stats.totalTrades === 0) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "📊 No trades with signal metadata yet.\n\nMetadata is captured on new buys from this version forward.",
+    });
+    return;
+  }
+
+  const filter = stats.activeFilter;
+  const filterStr = (filter.mcapMin > 0 || filter.mcapMax > 0)
+    ? `${filter.mcapMin > 0 ? fmtMcap(filter.mcapMin) : "$0"} – ${filter.mcapMax > 0 ? fmtMcap(filter.mcapMax) : "∞"}`
+    : "none";
+
+  const tierLines = stats.byMcapTier
+    .filter((t) => t.count > 0)
+    .map((t) => {
+      const star = stats.bestMcapTier?.label === t.label ? " ★" : "";
+      const pnl = t.avgPnlPct >= 0 ? `+${t.avgPnlPct.toFixed(1)}%` : `${t.avgPnlPct.toFixed(1)}%`;
+      return `  ${escapeHtml(t.label)}: ${(t.winRate * 100).toFixed(0)}% win | avg ${pnl} | ${t.count}${star}`;
+    }).join("\n");
+
+  const corrTop = Object.entries(stats.correlations)
+    .filter(([, v]) => Math.abs(v) > 0.05)
+    .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
+    .slice(0, 4)
+    .map(([k, v]) => `${k}: ${v >= 0 ? "+" : ""}${v.toFixed(2)}`)
+    .join(" | ");
+
+  const lines: string[] = [
+    `📊 <b>Signal Stats</b> — ${stats.totalTrades} trades with metadata`,
+    "",
+    `<b>MCap at Entry</b>`,
+    `  Median: ${fmtMcap(stats.mcap.median)} | Mean: ${fmtMcap(stats.mcap.mean)}`,
+    `  Range: ${fmtMcap(stats.mcap.min)} – ${fmtMcap(stats.mcap.max)}`,
+    "",
+    `<b>Win Rate by MCap Tier</b>`,
+    tierLines,
+    "",
+    corrTop ? `<b>Correlations w/ PnL</b>\n  ${corrTop}` : "",
+    "",
+    `<b>Active filter:</b> ${filterStr}`,
+  ].filter((l) => l !== undefined);
+
+  const keyboard: unknown[] = [];
+  if (stats.bestMcapTier) {
+    const t = stats.bestMcapTier;
+    const minVal = t.minMcap;
+    const maxVal = t.maxMcap;
+    keyboard.push({
+      text: `Adopt ${t.label} range`,
+      callback_data: `stats_adopt:${minVal}:${maxVal}`,
+    });
+  }
+  if (filter.mcapMin > 0 || filter.mcapMax > 0) {
+    keyboard.push({ text: "Clear filter", callback_data: "stats_adopt:0:0" });
+  }
+
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    reply_markup: keyboard.length > 0 ? { inline_keyboard: [keyboard] } : undefined,
+  });
+}
+
 async function handlePnl(chatId: number): Promise<void> {
   const all = await getClosedTrades(500);
   if (all.length === 0) {
@@ -908,6 +1002,58 @@ async function handleLlm(chatId: number): Promise<void> {
     parse_mode: "HTML",
   });
   logger.info({ llm: now }, "[telegram] LLM toggled via /llm");
+}
+
+// ---------------------------------------------------------------------------
+// /mcapfilter [min] [max | off] — manually set the MCap entry filter.
+// ---------------------------------------------------------------------------
+async function handleMcapFilter(chatId: number, argText: string): Promise<void> {
+  const arg = argText.trim().toLowerCase();
+
+  if (!arg) {
+    const { alertFilter } = getRuntimeSettings();
+    const active = alertFilter.mcapMin > 0 || alertFilter.mcapMax > 0;
+    const status = active
+      ? `${alertFilter.mcapMin > 0 ? fmtMcap(alertFilter.mcapMin) : "$0"} – ${alertFilter.mcapMax > 0 ? fmtMcap(alertFilter.mcapMax) : "∞"}`
+      : "none";
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: `<b>MCap Entry Filter</b>\nCurrent: <b>${status}</b>\n\nUsage:\n<code>/mcapfilter 50000 200000</code> — $50k–$200k\n<code>/mcapfilter 50000</code> — $50k floor, no ceiling\n<code>/mcapfilter 0 500000</code> — no floor, $500k ceiling\n<code>/mcapfilter off</code> — clear filter`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  if (arg === "off" || arg === "clear" || arg === "0") {
+    updateRuntimeSettings((draft) => { draft.alertFilter.mcapMin = 0; draft.alertFilter.mcapMax = 0; });
+    await tgPost("sendMessage", { chat_id: chatId, text: "✅ MCap filter cleared — all alerts allowed.", parse_mode: "HTML" });
+    return;
+  }
+
+  const parts = arg.split(/\s+/);
+  const minVal = Number(parts[0]);
+  const maxVal = parts[1] !== undefined ? Number(parts[1]) : 0;
+
+  if (!Number.isFinite(minVal) || minVal < 0) {
+    await tgPost("sendMessage", { chat_id: chatId, text: "❌ Invalid min value. Use a number like <code>50000</code>.", parse_mode: "HTML" });
+    return;
+  }
+  if (parts[1] !== undefined && (!Number.isFinite(maxVal) || maxVal < 0)) {
+    await tgPost("sendMessage", { chat_id: chatId, text: "❌ Invalid max value. Use a number like <code>200000</code> or omit for no ceiling.", parse_mode: "HTML" });
+    return;
+  }
+  if (maxVal > 0 && maxVal <= minVal) {
+    await tgPost("sendMessage", { chat_id: chatId, text: "❌ Max must be greater than min.", parse_mode: "HTML" });
+    return;
+  }
+
+  updateRuntimeSettings((draft) => { draft.alertFilter.mcapMin = minVal; draft.alertFilter.mcapMax = maxVal; });
+  const rangeStr = `${minVal > 0 ? fmtMcap(minVal) : "$0"} – ${maxVal > 0 ? fmtMcap(maxVal) : "∞"}`;
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: `✅ MCap filter set: <b>${rangeStr}</b>\nAlerts outside this range will be ignored.`,
+    parse_mode: "HTML",
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,6 +1841,8 @@ export function startTelegramBot(): () => void {
       { command: "start",     description: "MoonBags dashboard" },
       { command: "positions", description: "Open positions + force-sell buttons" },
       { command: "pnl",       description: "Today's PnL + all-time stats" },
+      { command: "stats",     description: "Signal stats by mcap tier + adopt best range filter" },
+      { command: "mcapfilter", description: "Set MCap entry filter (e.g. /mcapfilter 50000 200000 or off)" },
       { command: "history",   description: "Last N closed trades (default 10)" },
       { command: "settings",  description: "Edit trading params live (no restart)" },
       { command: "llm",       description: "Toggle the LLM exit advisor on/off" },
@@ -1779,6 +1927,8 @@ export function startTelegramBot(): () => void {
               case "/positions": await sendPositions(chatId); break;
               case "/settings":  await sendSettingsMenu(chatId); break;
               case "/pnl":       await handlePnl(chatId); break;
+              case "/stats":        await handleStats(chatId); break;
+              case "/mcapfilter":  await handleMcapFilter(chatId, argText); break;
               case "/history":   await handleHistory(chatId, argText); break;
               case "/llm":       await handleLlm(chatId); break;
               case "/pause":     await handlePause(chatId); break;

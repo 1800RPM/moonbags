@@ -410,6 +410,8 @@ MAX_RUG_RATIO=0
 MAX_BUNDLER_PCT=0
 MAX_TOP10_PCT=0
 REQUIRE_RISING_LIQ=false
+MIN_ALERT_MCAP=0              # only buy alerts at or above this mcap ($). Also editable via /mcapfilter or /stats
+MAX_ALERT_MCAP=0              # only buy alerts at or below this mcap ($). Also editable via /mcapfilter or /stats
 
 # === POLLING ===
 SCG_POLL_MS=3000               # how often to poll SCG for new alerts
@@ -544,6 +546,8 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 | `/positions` | Open positions with one-tap force-sell buttons. Auto-refreshes 1.5s after a sell fires. |
 | `/settings` | Interactive menu with Buy, Exit Strategy, Risk Controls, TP targets, milestones, and LLM controls. Trading changes save to `state/settings.json` and apply on next tick — **no restart**. |
 | `/pnl` | Today's PnL + all-time stats, win/loss count, win rate, best + worst trade. Reads `state/closed.json`. |
+| `/stats` | Signal metadata analysis — win rate + avg PnL by mcap tier, Pearson correlations between signal fields and trade outcomes. Includes an inline "Adopt" button to activate the best-performing mcap range as an entry filter in one tap. Stats grow as new trades close (forward testing only). |
+| `/mcapfilter [min] [max\|off]` | Set or clear the mcap entry filter manually. `/mcapfilter 50000 200000` = $50k–$200k range. `/mcapfilter 50000` = $50k floor, no ceiling. `/mcapfilter off` = clear. Persists in `state/settings.json`. |
 | `/history [N]` | Last N closed trades (default 10, max 50) — name, PnL, exit reason, hold duration. |
 | `/llm` | One-tap toggle for the LLM exit advisor. Warns if `MINIMAX_API_KEY` is empty. |
 | `/pause` | Stop taking new SCG alerts. Open positions keep running. **Persists across restart.** |
@@ -605,7 +609,9 @@ For each armed position, it gets a compact JSON payload with:
 - **Risk profile:** dev current holding %, dev sell status tag, LP burned %, top10 concentration, sniper status, token tags
 - **Recent signals:** smart money / KOL / whale movements scoped to this token (last 60 min)
 - **Klines:** 60 1m candles + 60 5m candles (closes + USD volumes)
-- **Deterministic evidence facts:** `bundlerDistribution`, `smartMoneySelling`, `topHolderCapitulation`, `volumeCliff`, `roundTripRisk`
+- **Deterministic evidence facts:**
+  - *Bearish (reactive):* `bundlerDistribution`, `smartMoneySelling`, `topHolderCapitulation`, `volumeCliff`, `roundTripRisk`
+  - *Proactive (sell-into-strength):* `priceAcceleration` (parabolic 1m candle), `volumeBlowoff` (5m volume ≥ 3× hourly avg), `txRatioBurst` (5m tx count ≥ 2× hourly avg), `pctFromAthSpike` (price within 5% of ATH on a +100% winner)
 - **Memory:** recent same-position decisions, global closed-trade track record, and similar historical cases when the same evidence facts appeared
 
 ### What the LLM can decide
@@ -620,6 +626,10 @@ Four actions:
 | `exit_now` | Sells the entire position immediately, bypassing the trail |
 
 The LLM **cannot** buy more or override the hard stop. Aggressive actions are hard-gated: `partial_exit` and `exit_now` are blocked unless the deterministic evidence object allows them, and trail tightening is blocked unless at least two evidence facts are active. Every non-hold reason must cite exact fact keys.
+
+The gate has two unlock paths:
+- **Bearish path:** 2+ reactive facts (existing behaviour)
+- **Proactive path:** 2+ proactive facts OR 1 proactive + 1 bearish — enables selling into strength at blow-off tops without waiting for on-chain confirmation of the reversal
 
 Each consult writes an audit record to `state/llm_audits/<mint>.json` with the exact prompt payload, evidence facts, similar-case memory, raw tool arguments, parsed decision, and gate result.
 
@@ -687,6 +697,8 @@ Changes take effect on the next tick — no restart needed.
 ## Web dashboard
 
 A live dashboard runs on `http://localhost:8787/` (configurable via `DASHBOARD_PORT`). React/Vite SPA, polls `/api/state` every 2 seconds.
+
+**Signal stats page** — `http://localhost:8787/stats` — auto-refreshing table of win rate by mcap tier, distribution stats (mean/median/stdev), and Pearson correlations. Same data as the Telegram `/stats` command.
 
 **Pepe-on-the-Moon theme** — Pepe green primary, Earth visor blue accent, coral for losses, on a true space-black surface with a faint star field and Earth-glow gradient.
 
@@ -891,7 +903,7 @@ Common fixes:
 - OnchainOS missing: `npm run install:onchainos`, then reopen terminal or add `~/.local/bin` to PATH.
 - Bot running under old env: `pm2 restart moonbags --update-env`.
 - Telegram quiet: send `/doctor`, then `/setup_status`, then check `pm2 logs moonbags`.
-- No entry signals: send `/ping`. If it says the poller is alive but recent decisions are filtered, check `MAX_ALERT_AGE_MINS`, `MIN_LIQUIDITY_USD`, `MIN_SCORE`, and the other alert filters in `.env`. `0` disables each numeric filter.
+- No entry signals: send `/ping`. If it says the poller is alive but recent decisions are filtered, check `MAX_ALERT_AGE_MINS`, `MIN_LIQUIDITY_USD`, `MIN_SCORE`, and the other alert filters in `.env`. `0` disables each numeric filter. Also check `/mcapfilter` — if an mcap range is active, alerts outside it are silently dropped.
 - Need latest version: send `/update` in Telegram after `pm2` is set up.
 
 ---
@@ -928,7 +940,7 @@ src/
 ├── llmExitAdvisor.ts    ← MiniMax M2.7 client + tool calling (`enable_thinking`, `extra_body.reasoning_split`)
 ├── notifier.ts          ← Telegram notifications (with HTML escaping)
 ├── telegramBot.ts       ← Telegram command handler (long polling, force_reply for edits)
-├── server.ts            ← localhost web dashboard backend (`/api/state` JSON, static serve)
+├── server.ts            ← localhost web dashboard backend (`/api/state` JSON, `/api/stats` signal stats, `/stats` HTML page, static serve)
 ├── _setup.ts            ← interactive first-time setup wizard (`npm run setup`)
 ├── _backtest.ts         ← grid-search backtester
 └── _okxTest.ts          ← ad-hoc on-chain snapshot tool
