@@ -295,11 +295,12 @@ function formatPosition(p: Position): string {
   const drawdown = peak > 0 ? (1 - cur / peak) * 100 : 0;
   const armed = p.armed ? " ⚡" : "";
   const icon = pnl >= 0 ? "🟢" : "🔴";
-  const mint = `${p.mint.slice(0, 4)}…${p.mint.slice(-4)}`;
+  const mintShort = `${p.mint.slice(0, 4)}…${p.mint.slice(-4)}`;
+  const gmgnUrl = `https://gmgn.ai/sol/token/${encodeURIComponent(p.mint)}`;
   const source = p.signalMeta?.source;
   const sourceTag = source ? ` · ${escapeHtml(source)}` : "";
   return (
-    `${icon} <b>${escapeHtml(p.name)}</b>${armed}  <code>${escapeHtml(mint)}</code>${sourceTag}\n` +
+    `${icon} <b>${escapeHtml(p.name)}</b>${armed}  <a href="${gmgnUrl}"><code>${escapeHtml(mintShort)}</code></a>${sourceTag}  <a href="${gmgnUrl}">📈 GMGN</a>\n` +
     `   PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}%  peak: ${entry > 0 ? ((peak / entry - 1) * 100).toFixed(0) : "0"}%  pullback: ${drawdown.toFixed(1)}%`
   );
 }
