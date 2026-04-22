@@ -270,7 +270,7 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     minHolderGrowthPct: 5,
     maxLiquidityDropPct: 30,
     minBuySellRatio: 1.15,
-    minSmartOrKolCount: 1,
+    minSmartOrKolCount: 0,
   },
   mintCooldownMins: 90,
   liveScoreMin: 60,
