@@ -42,7 +42,7 @@ const TOKEN_LIMIT = parseInt(arg("--tokens", "0"));
 const MIN_CANDLES = parseInt(arg("--min-candles", "60"));   // ~5 hours of 5m data
 const STRATEGY    = arg("--strategy", "all");               // "all" | "simple" | "hybrid" | "protective"
 // [SCG-DISABLED 2026-04-22] CLI default flipped from "scg" to "gmgn".
-const SOURCE      = arg("--source", "gmgn");                // "scg" | "hot" | "gmgn"
+const SOURCE      = arg("--source", "gmgn");                // "scg" | "hot" | "gmgn" | "okx"
 const FEE_BPS     = parseInt(arg("--fee-bps", "50"));         // Ultra platform fee per swap (50 bps = 0.5%)
 const SLIPPAGE_BPS = parseInt(arg("--slippage-bps", "150"));  // estimated slippage per swap (150 bps = 1.5%)
 
@@ -96,7 +96,7 @@ interface TokenSample {
   alertTimeSec?: number;
   alertMcap?: number;
   impliedSupply?: number;
-  source: "scg" | "hot" | "gmgn";
+  source: "scg" | "hot" | "gmgn" | "okx";
 }
 interface CandleSample {
   symbol: string;
@@ -217,6 +217,57 @@ function pickGmgnNumber(row: GmgnRow, keys: string[]): number | undefined {
   return undefined;
 }
 
+type OkxSignalListRow = {
+  amountUsd?: string;
+  timestamp?: string;
+  triggerWalletCount?: string;
+  walletType?: string;
+  cursor?: string;
+  token?: {
+    holders?: string;
+    marketCapUsd?: string;
+    name?: string;
+    symbol?: string;
+    tokenAddress?: string;
+    top10HolderPercent?: string;
+  };
+};
+
+async function fetchOkxSignals(pages = 2): Promise<TokenSample[]> {
+  const seen = new Set<string>();
+  const out: TokenSample[] = [];
+  let cursor: string | undefined;
+  for (let p = 0; p < pages; p++) {
+    const args = ["signal", "list", "--chain", "solana", "--limit", "100"];
+    if (cursor) args.push("--cursor", cursor);
+    const rows = await runOnchainosJson<OkxSignalListRow[]>(args, 15_000).catch(() => null);
+    if (!rows || rows.length === 0) break;
+    for (const row of rows) {
+      const mint = row.token?.tokenAddress ?? "";
+      if (!mint || seen.has(mint)) continue;
+      seen.add(mint);
+      const ts = Number(row.timestamp);
+      const alertTimeSec = Number.isFinite(ts) && ts > 0
+        ? (ts > 1e12 ? Math.floor(ts / 1000) : Math.floor(ts))
+        : undefined;
+      out.push({
+        address: mint,
+        symbol: row.token?.symbol ?? row.token?.name ?? mint.slice(0, 6),
+        alertTimeSec,
+        alertMcap: Number(row.token?.marketCapUsd) || undefined,
+        source: "okx",
+      });
+    }
+    cursor = rows[rows.length - 1]?.cursor;
+    if (!cursor) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (out.length === 0) {
+    throw new Error("OKX signal list returned no tokens. Check onchainos CLI auth and `onchainos signal list --chain solana --limit 1`.");
+  }
+  return out;
+}
+
 async function fetchGmgnTokens(): Promise<TokenSample[]> {
   if (!isGmgnConfigured()) {
     throw new Error("GMGN_API_KEY is not set — cannot run GMGN backtest. Add it to .env and restart.");
@@ -328,8 +379,8 @@ function hasRunway(candles: Candle[], alertTimeSec?: number): boolean {
   return Boolean(lastTs && lastTs - alertTimeSec * 1000 >= SCG_MIN_RUNWAY_MS);
 }
 
-function minCandlesForBar(bar: string, configuredMin: number, source: "scg" | "hot" | "gmgn"): number {
-  if (source === "scg" || source === "gmgn") return MIN_CANDLES_BY_BAR[bar] ?? configuredMin;
+function minCandlesForBar(bar: string, configuredMin: number, source: "scg" | "hot" | "gmgn" | "okx"): number {
+  if (source === "scg" || source === "gmgn" || source === "okx") return MIN_CANDLES_BY_BAR[bar] ?? configuredMin;
   return configuredMin;
 }
 
@@ -582,7 +633,7 @@ export interface RunBacktestOptions {
   mbTrailRange?: number[];    // moonbag's own drawdown trail. default [0.50, 0.60, 0.70]
   mbTimeoutRange?: number[];  // moonbag max hold, minutes. default [30, 60, 120]
   onProgress?: (stage: "fetching" | "simulating", pct: number) => void;
-  source?: "scg" | "hot" | "gmgn";
+  source?: "scg" | "hot" | "gmgn" | "okx";
   tokenLimit?: number;
 }
 
@@ -592,7 +643,7 @@ export interface RunBacktestResult {
   allResults: GridResult[];     // full grid, sorted best→worst
   topResults: GridResult[];     // top N slice for convenience
   bar: string;
-  source: "scg" | "hot" | "gmgn";
+  source: "scg" | "hot" | "gmgn" | "okx";
   resolutionCounts: Record<string, number>;
   entrySourceCounts: Record<string, number>;
   durationMs: number;
@@ -626,7 +677,9 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
     //   :
     source === "gmgn"
       ? await fetchGmgnTokens()
-      : await fetchHotTokens();
+      : source === "okx"
+        ? await fetchOkxSignals()
+        : await fetchHotTokens();
   const tokens = opts.tokenLimit && opts.tokenLimit > 0 ? fetchedTokens.slice(0, opts.tokenLimit) : fetchedTokens;
 
   // 2. Fetch klines in parallel batches

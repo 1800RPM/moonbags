@@ -693,7 +693,7 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
 
   if (data.startsWith("backtest:run:")) {
     const [, , rawSource, rawMode] = data.split(":");
-    const source = rawSource === "scg" || rawSource === "gmgn" ? rawSource : "gmgn";
+    const source = rawSource === "okx" || rawSource === "gmgn" ? rawSource : "gmgn";
     const mode = rawMode === "hybrid" ? "hybrid" : "all";
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${source.toUpperCase()} · ${mode}...` });
     await handleBacktest(chatId, `${source} ${mode}`);
@@ -1718,9 +1718,13 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
       chat_id: chatId,
       text:
         "🧪 <b>Choose backtest configuration</b>\n\n" +
-        "<b>Source:</b> which candidate feed to pull\n" +
-        "<b>Strategy grid:</b> <code>all</code> = trail + fixed TP + TP ladder · <code>hybrid</code> = adds scale-out + moonbag\n\n" +
-        "Each run fetches OHLCV, scores the top 5 exit configs, and lets you tap <b>Adopt</b> to apply live (no restart).",
+        "<b>Source</b> — which candidate feed to replay forward\n" +
+        "  • <b>GMGN</b> — live signals/trenches (first-candle or after-call entry)\n" +
+        "  • <b>OKX</b> — historical OKX signal-stream events with timestamps\n\n" +
+        "<b>Grid</b> — which exit-strategy space to sweep\n" +
+        "  • <b>All</b> — trail + fixed TP + TP ladder\n" +
+        "  • <b>Hybrid</b> — above + scale-out + moonbag\n\n" +
+        "Each run fetches OHLCV, scores the top 5, and lets you tap <b>Adopt</b> to apply live (no restart).",
       parse_mode: "HTML",
       reply_markup: {
         inline_keyboard: [
@@ -1729,8 +1733,8 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
             { text: "🟢 GMGN · hybrid", callback_data: "backtest:run:gmgn:hybrid" },
           ],
           [
-            { text: "⚪️ SCG (legacy) · all", callback_data: "backtest:run:scg:all" },
-            { text: "⚪️ SCG (legacy) · hybrid", callback_data: "backtest:run:scg:hybrid" },
+            { text: "🔵 OKX · all", callback_data: "backtest:run:okx:all" },
+            { text: "🔵 OKX · hybrid", callback_data: "backtest:run:okx:hybrid" },
           ],
         ],
       },
@@ -1739,11 +1743,11 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   }
 
   const tokens = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
-  let source: "scg" | "gmgn" = "gmgn";
+  let source: "gmgn" | "okx" = "gmgn";
   let mode: "all" | "hybrid" = "all";
   for (const tok of tokens) {
     if (tok === "gmgn") source = "gmgn";
-    else if (tok === "scg") source = "scg";
+    else if (tok === "okx") source = "okx";
     else if (tok === "hybrid") mode = "hybrid";
     else if (tok === "all") mode = "all";
   }
@@ -1761,11 +1765,11 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const llmWarning = CONFIG.LLM_EXIT_ENABLED
     ? "\n⚠️ <b>LLM exit advisor is ON.</b> LLM decisions are not candle-backtestable; this compares deterministic exits only."
     : "";
-  const sourceLabel = source === "gmgn" ? "GMGN" : "SCG";
+  const sourceLabel = source === "gmgn" ? "GMGN" : "OKX";
   const fetchBlurb =
     source === "gmgn"
-      ? "Fetching GMGN signals/trenches/trending + OHLCV. Signal calls with timestamps use after-call candles; others use first-candle entry."
-      : "Fetching SCG alerts + OHLCV from signal time with at least ~24h runway when available.";
+      ? "Fetching GMGN signals/trenches + OHLCV. Signal calls with timestamps use after-call candles; others use first-candle entry."
+      : "Fetching OKX signal-stream history via onchainos + OHLCV from each signal's timestamp with at least ~24h runway.";
   const startMsg = await tgPost("sendMessage", {
     chat_id: chatId,
     text:
