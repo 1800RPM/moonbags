@@ -317,7 +317,7 @@ function currentSettings(): GmgnSettings {
     typeof (runtime.signals as Record<string, unknown>).sourceMode === "string"
       ? String((runtime.signals as Record<string, unknown>).sourceMode)
       : DEFAULT_SETTINGS.sourceMode;
-  const isGmgnLiveSourceMode = sourceMode === "gmgn_live" || sourceMode === "gmgn_only";
+  const isGmgnLiveSourceMode = sourceMode === "gmgn_live" || sourceMode === "gmgn_only" || sourceMode === "hybrid";
   const modeFromSource: GmgnMode = isGmgnLiveSourceMode ? "live" : "watch";
   const trending = (rec.trending && typeof rec.trending === "object" ? rec.trending : {}) as Record<string, unknown>;
   const trenches = (rec.trenches && typeof rec.trenches === "object" ? rec.trenches : {}) as Record<string, unknown>;

@@ -111,7 +111,7 @@ export const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
 export const SOURCE_MODE_LABELS: Record<SourceMode, string> = {
   scg_only: "SCG only",
   okx_watch: "OKX Watch",
-  hybrid: "Hybrid Live",
+  hybrid: "Hybrid (OKX + GMGN live)",
   okx_only: "OKX only",
   gmgn_watch: "GMGN Watch",
   gmgn_live: "GMGN Live",
