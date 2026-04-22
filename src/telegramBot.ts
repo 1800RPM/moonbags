@@ -691,6 +691,15 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     return;
   }
 
+  if (data.startsWith("backtest:run:")) {
+    const [, , rawSource, rawMode] = data.split(":");
+    const source = rawSource === "scg" || rawSource === "gmgn" ? rawSource : "gmgn";
+    const mode = rawMode === "hybrid" ? "hybrid" : "all";
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${source.toUpperCase()} · ${mode}...` });
+    await handleBacktest(chatId, `${source} ${mode}`);
+    return;
+  }
+
   if (data === "wss:refresh") {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Refreshed" });
     await handleWss(chatId);
@@ -1696,16 +1705,40 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   // that live SCG polling is off. You can still pass `scg` explicitly to backtest
   // against the SCG upstream (fetchScgTokens is still defined in _backtest.ts),
   // but the default CLI path no longer hits SCG.
-  //   /backtest                  → gmgn + all
+  //   /backtest                  → interactive menu (buttons)
   //   /backtest hybrid           → gmgn + hybrid
   //   /backtest gmgn             → gmgn + all
   //   /backtest gmgn hybrid      → gmgn + hybrid
   //   /backtest_hybrid           → gmgn + hybrid (alias of `/backtest hybrid`)
-  const tokens = argText
-    .trim()
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean);
+  const trimmed = argText.trim();
+
+  // Bare `/backtest` — show button menu so users discover variants without docs.
+  if (trimmed === "") {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        "🧪 <b>Choose backtest configuration</b>\n\n" +
+        "<b>Source:</b> which candidate feed to pull\n" +
+        "<b>Strategy grid:</b> <code>all</code> = trail + fixed TP + TP ladder · <code>hybrid</code> = adds scale-out + moonbag\n\n" +
+        "Each run fetches OHLCV, scores the top 5 exit configs, and lets you tap <b>Adopt</b> to apply live (no restart).",
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🟢 GMGN · all", callback_data: "backtest:run:gmgn:all" },
+            { text: "🟢 GMGN · hybrid", callback_data: "backtest:run:gmgn:hybrid" },
+          ],
+          [
+            { text: "⚪️ SCG (legacy) · all", callback_data: "backtest:run:scg:all" },
+            { text: "⚪️ SCG (legacy) · hybrid", callback_data: "backtest:run:scg:hybrid" },
+          ],
+        ],
+      },
+    });
+    return;
+  }
+
+  const tokens = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
   let source: "scg" | "gmgn" = "gmgn";
   let mode: "all" | "hybrid" = "all";
   for (const tok of tokens) {
