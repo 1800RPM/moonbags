@@ -19,6 +19,8 @@ import { getPositionSnapshot } from "./okxClient.js";
 import { getOkxWsStatus, unwatchOkxWsMint, watchOkxWsMint } from "./okxWsService.js";
 import { escapeHtml } from "./notifier.js";
 import { runBacktest, type BacktestTpTarget } from "./_backtest.js";
+import { runOkxFilterAnalysis, type OkxFilterAnalysisResult, type SweepResult as OkxSweepResult } from "./_okxFilterAnalysis.js";
+import { runGmgnFilterAnalysis, type GmgnFilterAnalysisResult, type GmgnSweepResult } from "./_gmgnFilterAnalysis.js";
 import {
   getUpdateBlockerDetails,
   getUpdatePreview,
@@ -699,6 +701,11 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   if (data.startsWith("backtest:run:")) {
     const [, , rawSource, rawMode] = data.split(":");
     const source = rawSource === "okx" || rawSource === "gmgn" ? rawSource : "gmgn";
+    if (rawMode === "filter") {
+      await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${source.toUpperCase()} filter sweep...` });
+      await handleFilterSweep(chatId, source);
+      return;
+    }
     const mode = rawMode === "hybrid" ? "hybrid" : "all";
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${source.toUpperCase()} · ${mode}...` });
     await handleBacktest(chatId, `${source} ${mode}`);
@@ -1752,6 +1759,10 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
             { text: "🔵 OKX · all", callback_data: "backtest:run:okx:all" },
             { text: "🔵 OKX · hybrid", callback_data: "backtest:run:okx:hybrid" },
           ],
+          [
+            { text: "🔬 GMGN filter sweep", callback_data: "backtest:run:gmgn:filter" },
+            { text: "🔬 OKX filter sweep", callback_data: "backtest:run:okx:filter" },
+          ],
         ],
       },
     });
@@ -1953,6 +1964,319 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
     });
   } finally {
     backtestInFlight = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Filter-sweep handler (Telegram wrapper around runOkxFilterAnalysis /
+// runGmgnFilterAnalysis). Streams progress by editing a status message,
+// then formats the threshold sweep as <pre> tables split across messages.
+// ---------------------------------------------------------------------------
+let filterSweepInFlight = false;
+
+const TELEGRAM_SOFT_LIMIT = 3800;
+
+type NormalizedSweep = {
+  field: string;
+  label: string;
+  dir: "min" | "max";
+  rows: Array<{ threshold: number; n: number; winPct: number; medMax: number; medFinal: number; medMin: number }>;
+};
+
+function fmtPctSigned(n: number): string {
+  const rounded = Math.round(n);
+  return `${rounded >= 0 ? "+" : ""}${rounded}%`;
+}
+
+function normalizeOkxSweeps(sweeps: OkxSweepResult[]): NormalizedSweep[] {
+  return sweeps.map((s) => ({
+    field: s.field,
+    label: s.label,
+    dir: s.dir,
+    rows: s.rows.map((r) => ({
+      threshold: r.threshold,
+      n: r.n,
+      winPct: r.winPct,
+      medMax: r.medianMaxPnl,
+      medFinal: r.medianFinalPnl,
+      medMin: r.medianMinPnl,
+    })),
+  }));
+}
+
+function normalizeGmgnSweeps(sweeps: GmgnSweepResult[]): NormalizedSweep[] {
+  return sweeps.map((s) => ({
+    field: s.field,
+    label: s.label,
+    dir: s.dir,
+    rows: s.rows.map((r) => ({
+      threshold: r.threshold,
+      n: r.n,
+      winPct: r.winPct,
+      medMax: r.medianMaxPnl,
+      medFinal: r.medianFinalPnl,
+      medMin: r.medianMinPnl,
+    })),
+  }));
+}
+
+function formatSweepBlock(sweep: NormalizedSweep): string {
+  // Top 3 thresholds by winPct, ties broken by larger n (more robust), then larger medMax.
+  const sorted = [...sweep.rows].sort((a, b) => {
+    if (b.winPct !== a.winPct) return b.winPct - a.winPct;
+    if (b.n !== a.n) return b.n - a.n;
+    return b.medMax - a.medMax;
+  });
+  const top3 = sorted.slice(0, 3);
+  const op = sweep.dir === "min" ? "≥" : "≤";
+  const lines: string[] = [];
+  lines.push(sweep.label);
+  for (const r of top3) {
+    const t = Number.isInteger(r.threshold) ? String(r.threshold) : r.threshold.toFixed(2);
+    lines.push(
+      `  ${sweep.field} ${op} ${t}: n=${r.n} win% ${r.winPct.toFixed(0)} medMax ${fmtPctSigned(r.medMax)} medFinal ${fmtPctSigned(r.medFinal)} medMin ${fmtPctSigned(r.medMin)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+// Pick best threshold per sweep with n >= minN, ranked by winPct. Returns the
+// numeric threshold (or null if nothing passes the floor).
+function bestThresholdFor(sweep: NormalizedSweep, minN: number): number | null {
+  const eligible = sweep.rows.filter((r) => r.n >= minN);
+  if (eligible.length === 0) return null;
+  eligible.sort((a, b) => {
+    if (b.winPct !== a.winPct) return b.winPct - a.winPct;
+    return b.n - a.n;
+  });
+  return eligible[0]!.threshold;
+}
+
+// Build a suggested-baseline object keyed for signals.okx.discovery.baseline
+// (or signals.gmgn.baseline). Only include sweeps that map cleanly.
+const OKX_FIELD_TO_BASELINE_KEY: Record<string, string> = {
+  holders: "minHolders",
+  liquidityUsd: "minLiquidityUsd",
+  top10Pct: "maxTop10HolderRate",
+  bundleHoldPct: "maxBundlerRate",
+  devHoldPct: "maxCreatorBalanceRate",
+};
+
+const GMGN_FIELD_TO_BASELINE_KEY: Record<string, string> = {
+  liquidityUsd: "minLiquidityUsd",
+  holders: "minHolders",
+  top10Pct: "maxTop10HolderRate",
+  rugRatio: "maxRugRatio",
+  bundlerPct: "maxBundlerRate",
+  creatorBalancePct: "maxCreatorBalanceRate",
+};
+
+function buildSuggestedBaseline(
+  sweeps: NormalizedSweep[],
+  fieldMap: Record<string, string>,
+  minN: number,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const sweep of sweeps) {
+    const key = fieldMap[sweep.field];
+    if (!key) continue;
+    const best = bestThresholdFor(sweep, minN);
+    if (best === null) continue;
+    // Skip trivial zero/max thresholds that are effectively "no filter".
+    if (sweep.dir === "min" && best === 0) continue;
+    if (sweep.dir === "max" && best === 100) continue;
+    out[key] = best;
+  }
+  return out;
+}
+
+function splitIntoChunks(blocks: string[], openTag: string, closeTag: string): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const block of blocks) {
+    const candidate = current ? `${current}\n\n${block}` : block;
+    // +tag overhead
+    if ((openTag.length + candidate.length + closeTag.length) > TELEGRAM_SOFT_LIMIT && current) {
+      chunks.push(`${openTag}${current}${closeTag}`);
+      current = block;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(`${openTag}${current}${closeTag}`);
+  return chunks;
+}
+
+async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promise<void> {
+  if (filterSweepInFlight) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "⏳ Filter sweep already running. Wait for it to finish.",
+    });
+    return;
+  }
+  filterSweepInFlight = true;
+
+  const sourceLabel = source === "okx" ? "OKX" : "GMGN";
+  const startMsg = await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: `🔬 <b>Running ${sourceLabel} filter sweep...</b>\n<i>Harvesting candidates + fetching forward OHLCV. Takes ~2-3 minutes.</i>`,
+    parse_mode: "HTML",
+  }) as { result?: { message_id?: number } };
+  const statusId = startMsg?.result?.message_id;
+
+  let lastEdit = 0;
+  const editProgress = async (stage: string, pct: number): Promise<void> => {
+    if (!statusId) return;
+    const now = Date.now();
+    if (now - lastEdit < 1500 && pct < 100) return; // throttle
+    lastEdit = now;
+    try {
+      await tgPost("editMessageText", {
+        chat_id: chatId,
+        message_id: statusId,
+        text: `🔬 <b>Running ${sourceLabel} filter sweep...</b>\n<i>${escapeHtml(stage)} (${pct}%)</i>`,
+        parse_mode: "HTML",
+      });
+    } catch {
+      // ignore transient edit failures
+    }
+  };
+
+  try {
+    let totalTokens = 0;
+    let withOhlcv = 0;
+    let csvPath = "";
+    let normalizedSweeps: NormalizedSweep[] = [];
+    let byTimeFrame: Array<{ tfLabel: string; n: number; winPct: number }> = [];
+    let baselineKeyPrefix = "";
+    let fieldMap: Record<string, string> = {};
+
+    if (source === "okx") {
+      const result: OkxFilterAnalysisResult = await runOkxFilterAnalysis({
+        onProgress: (stage, pct) => { void editProgress(stage, pct); },
+      });
+      totalTokens = result.totalTokens;
+      withOhlcv = result.withOhlcv;
+      csvPath = result.csvPath;
+      normalizedSweeps = normalizeOkxSweeps(result.sweeps);
+      byTimeFrame = result.byTimeFrame.map((t) => ({ tfLabel: t.tfLabel, n: t.n, winPct: t.winPct }));
+      baselineKeyPrefix = "signals.okx.discovery.baseline";
+      fieldMap = OKX_FIELD_TO_BASELINE_KEY;
+    } else {
+      const result: GmgnFilterAnalysisResult = await runGmgnFilterAnalysis({
+        onProgress: (stage, pct) => { void editProgress(stage, pct); },
+      });
+      totalTokens = result.totalTokens;
+      withOhlcv = result.withOhlcv;
+      csvPath = result.csvPath;
+      normalizedSweeps = normalizeGmgnSweeps(result.sweeps);
+      byTimeFrame = result.byTimeFrame.map((t) => ({ tfLabel: t.tfLabel, n: t.n, winPct: t.winPct }));
+      baselineKeyPrefix = "signals.gmgn.baseline";
+      fieldMap = GMGN_FIELD_TO_BASELINE_KEY;
+    }
+
+    if (totalTokens === 0) {
+      const msg = `❌ ${sourceLabel} filter sweep returned no candidates. Check API connectivity.`;
+      if (statusId) {
+        await tgPost("editMessageText", { chat_id: chatId, message_id: statusId, text: msg });
+      } else {
+        await tgPost("sendMessage", { chat_id: chatId, text: msg });
+      }
+      return;
+    }
+
+    if (withOhlcv === 0) {
+      const msg = `❌ ${sourceLabel} filter sweep: ${totalTokens} candidates but none had forward OHLCV.`;
+      if (statusId) {
+        await tgPost("editMessageText", { chat_id: chatId, message_id: statusId, text: msg });
+      } else {
+        await tgPost("sendMessage", { chat_id: chatId, text: msg });
+      }
+      return;
+    }
+
+    // --- Build output ---
+    const header: string[] = [];
+    header.push(`🔬 <b>${sourceLabel} filter sweep</b>`);
+    header.push(`${totalTokens} tokens · ${withOhlcv} with forward OHLCV · winner = maxPnL ≥ 50%`);
+    header.push(`CSV: <code>${escapeHtml(csvPath)}</code>`);
+    if (byTimeFrame.length > 0) {
+      const tfLine = byTimeFrame
+        .filter((t) => t.n > 0)
+        .map((t) => `${t.tfLabel} n=${t.n} win%${t.winPct.toFixed(0)}`)
+        .join(" · ");
+      if (tfLine) header.push(`By ${source === "okx" ? "time-frame" : "source"}: ${tfLine}`);
+    }
+
+    // Sweep <pre> blocks — each shows top 3 thresholds by winPct.
+    const sweepBlocks = normalizedSweeps.map((s) => formatSweepBlock(s));
+
+    // Suggested baseline
+    const suggested = buildSuggestedBaseline(normalizedSweeps, fieldMap, 20);
+    const suggestedKeys = Object.keys(suggested);
+    const suggestedLines: string[] = [];
+    suggestedLines.push(`<b>Suggested baseline</b> (paste into <code>${escapeHtml(baselineKeyPrefix)}</code>)`);
+    if (suggestedKeys.length === 0) {
+      suggestedLines.push(`<i>No sweep cleared the n≥20 floor — not enough data.</i>`);
+    } else {
+      suggestedLines.push(`<pre>${escapeHtml(JSON.stringify(suggested, null, 2))}</pre>`);
+    }
+
+    // First message: header + first batch of sweeps.
+    const headerText = header.join("\n");
+    const preChunks = splitIntoChunks(sweepBlocks, "<pre>", "</pre>");
+    const suggestedText = suggestedLines.join("\n");
+
+    // Try to fit first <pre> chunk into the status-edit message alongside the
+    // header; otherwise send header alone and push remaining chunks after.
+    const firstChunk = preChunks[0] ?? "";
+    const combinedFirst = `${headerText}\n\n${firstChunk}`;
+    const firstFits = combinedFirst.length <= TELEGRAM_SOFT_LIMIT;
+    const firstMessageText = firstFits ? combinedFirst : headerText;
+    const restChunks = firstFits ? preChunks.slice(1) : preChunks;
+
+    if (statusId) {
+      await tgPost("editMessageText", {
+        chat_id: chatId,
+        message_id: statusId,
+        text: firstMessageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    } else {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: firstMessageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    for (const chunk of restChunks) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: chunk,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: suggestedText,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "[telegram] filter sweep failed");
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: `❌ Filter sweep failed: ${escapeHtml((err as Error).message)}`,
+      parse_mode: "HTML",
+    });
+  } finally {
+    filterSweepInFlight = false;
   }
 }
 

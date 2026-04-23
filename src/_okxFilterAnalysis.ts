@@ -213,14 +213,70 @@ function median(xs: number[]): number {
   return ((s[m - 1] ?? 0) + (s[m] ?? 0)) / 2;
 }
 
-function summarize(label: string, g: Candidate[]): string {
-  if (g.length === 0) return `  ${label.padEnd(44)} n=0`;
+export type SweepSummary = {
+  n: number;
+  winPct: number;
+  medianMaxPnl: number;
+  medianFinalPnl: number;
+  medianMinPnl: number;
+};
+
+export type SweepRow = SweepSummary & { threshold: number; kept: number; dropped: number };
+
+export type SweepResult = {
+  field: string;
+  label: string;
+  dir: "min" | "max";
+  baseline: SweepSummary;
+  rows: SweepRow[];
+};
+
+export type TimeFrameSummary = SweepSummary & { tfLabel: string };
+
+export type OkxFilterAnalysisResult = {
+  totalTokens: number;
+  withOhlcv: number;
+  byTimeFrame: TimeFrameSummary[];
+  sweeps: SweepResult[];
+  csvPath: string;
+};
+
+function summarizeGroup(g: Candidate[]): SweepSummary {
+  if (g.length === 0) return { n: 0, winPct: 0, medianMaxPnl: 0, medianFinalPnl: 0, medianMinPnl: 0 };
   const wins = g.filter((c) => c.maxPnLPct >= WINNER_PCT).length;
-  const wr = (wins / g.length) * 100;
-  const mMax = median(g.map((c) => c.maxPnLPct));
-  const mFin = median(g.map((c) => c.finalPnLPct));
-  const mMin = median(g.map((c) => c.minPnLPct));
-  return `  ${label.padEnd(44)} n=${String(g.length).padStart(3)}  win@${WINNER_PCT}%=${wr.toFixed(0).padStart(3)}%  medMax=${mMax >= 0 ? "+" : ""}${mMax.toFixed(0)}%  medFinal=${mFin >= 0 ? "+" : ""}${mFin.toFixed(0)}%  medMin=${mMin.toFixed(0)}%`;
+  return {
+    n: g.length,
+    winPct: (wins / g.length) * 100,
+    medianMaxPnl: median(g.map((c) => c.maxPnLPct)),
+    medianFinalPnl: median(g.map((c) => c.finalPnLPct)),
+    medianMinPnl: median(g.map((c) => c.minPnLPct)),
+  };
+}
+
+function summarize(label: string, g: Candidate[]): string {
+  const s = summarizeGroup(g);
+  if (s.n === 0) return `  ${label.padEnd(44)} n=0`;
+  return `  ${label.padEnd(44)} n=${String(s.n).padStart(3)}  win@${WINNER_PCT}%=${s.winPct.toFixed(0).padStart(3)}%  medMax=${s.medianMaxPnl >= 0 ? "+" : ""}${s.medianMaxPnl.toFixed(0)}%  medFinal=${s.medianFinalPnl >= 0 ? "+" : ""}${s.medianFinalPnl.toFixed(0)}%  medMin=${s.medianMinPnl.toFixed(0)}%`;
+}
+
+function computeSweep(
+  label: string,
+  cs: Candidate[],
+  field: keyof Candidate,
+  thresholds: number[],
+  dir: "min" | "max",
+): SweepResult {
+  const baseline = summarizeGroup(cs);
+  const rows: SweepRow[] = thresholds.map((t) => {
+    const kept = cs.filter((c) => {
+      const v = c[field] as number;
+      return dir === "min" ? v >= t : v <= t;
+    });
+    const dropped = cs.length - kept.length;
+    const s = summarizeGroup(kept);
+    return { threshold: t, kept: kept.length, dropped, ...s };
+  });
+  return { field: String(field), label, dir, baseline, rows };
 }
 
 function sweep(label: string, cs: Candidate[], field: keyof Candidate, thresholds: number[], dir: "min" | "max"): void {
@@ -234,6 +290,80 @@ function sweep(label: string, cs: Candidate[], field: keyof Candidate, threshold
     const dropped = cs.length - kept.length;
     console.log(summarize(`${String(field)} ${dir === "min" ? ">=" : "<="} ${t} (drops ${dropped})`, kept));
   }
+}
+
+const OKX_SWEEP_SPECS: Array<{ label: string; field: keyof Candidate; thresholds: number[]; dir: "min" | "max" }> = [
+  { label: "holders (baseline minHolders)", field: "holders", thresholds: [0, 100, 200, 500, 1_000, 2_500, 5_000], dir: "min" },
+  { label: "liquidityUsd (baseline minLiquidityUsd)", field: "liquidityUsd", thresholds: [0, 5_000, 10_000, 25_000, 50_000, 100_000], dir: "min" },
+  { label: "marketCapUsd — lower bound", field: "marketCapUsd", thresholds: [0, 10_000, 25_000, 50_000, 100_000, 250_000], dir: "min" },
+  { label: "marketCapUsd — upper bound", field: "marketCapUsd", thresholds: [5_000_000, 1_000_000, 500_000, 250_000, 100_000], dir: "max" },
+  { label: "top10Pct (baseline maxTop10HolderRate, 0-100)", field: "top10Pct", thresholds: [100, 50, 40, 30, 25, 20], dir: "max" },
+  { label: "bundleHoldPct (baseline maxBundlerRate)", field: "bundleHoldPct", thresholds: [100, 50, 30, 20, 10, 5], dir: "max" },
+  { label: "devHoldPct (baseline maxCreatorBalanceRate)", field: "devHoldPct", thresholds: [100, 30, 20, 15, 10, 5], dir: "max" },
+  { label: "uniqueTraders", field: "uniqueTraders", thresholds: [0, 25, 50, 100, 250, 500], dir: "min" },
+  { label: "buySellRatio (trigger minBuySellRatio)", field: "buySellRatio", thresholds: [0, 1, 1.15, 1.5, 2, 3], dir: "min" },
+  { label: "volumeUsd (hot-tokens window)", field: "volumeUsd", thresholds: [0, 10_000, 50_000, 250_000, 1_000_000], dir: "min" },
+  { label: "priceChangePct (already pumping?)", field: "priceChangePct", thresholds: [0, 5, 10, 25, 50], dir: "min" },
+  { label: "tokenAgeHours (filter out fresh rugs)", field: "tokenAgeHours", thresholds: [0, 1, 6, 24, 72, 168], dir: "min" },
+];
+
+export async function runOkxFilterAnalysis(opts?: {
+  timeFrames?: string[];
+  onProgress?: (stage: string, pct: number) => void;
+}): Promise<OkxFilterAnalysisResult> {
+  const timeFrames = opts?.timeFrames && opts.timeFrames.length > 0 ? opts.timeFrames : ["1", "2", "3", "4"];
+  const onProgress = opts?.onProgress;
+
+  onProgress?.("harvesting hot-tokens", 0);
+  const cs = await harvestHotTokens(timeFrames);
+  onProgress?.(`harvested ${cs.length} unique tokens`, 10);
+
+  if (cs.length === 0) {
+    return {
+      totalTokens: 0,
+      withOhlcv: 0,
+      byTimeFrame: [],
+      sweeps: [],
+      csvPath: "",
+    };
+  }
+
+  let withOhlcv = 0;
+  for (let i = 0; i < cs.length; i++) {
+    const c = cs[i]!;
+    const candles = await fetchKlines(c.mint);
+    computeForwardPnL(c, candles);
+    if (c.hasOhlcv) withOhlcv++;
+    if (i % 5 === 0 || i === cs.length - 1) {
+      const pct = 10 + Math.round(((i + 1) / cs.length) * 80);
+      onProgress?.(`OHLCV ${i + 1}/${cs.length} (hasData=${withOhlcv})`, pct);
+    }
+  }
+
+  const csvPath = await writeCsv(cs);
+  onProgress?.("computing sweeps", 95);
+
+  const usable = cs.filter((c) => c.hasOhlcv);
+
+  const byTimeFrame: TimeFrameSummary[] = timeFrames.map((tf) => {
+    const label = TF_LABELS[tf] ?? tf;
+    const group = usable.filter((c) => c.tfLabel === label);
+    return { tfLabel: label, ...summarizeGroup(group) };
+  });
+
+  const sweeps: SweepResult[] = OKX_SWEEP_SPECS.map((spec) =>
+    computeSweep(spec.label, usable, spec.field, spec.thresholds, spec.dir),
+  );
+
+  onProgress?.("done", 100);
+
+  return {
+    totalTokens: cs.length,
+    withOhlcv,
+    byTimeFrame,
+    sweeps,
+    csvPath,
+  };
 }
 
 async function writeCsv(cs: Candidate[]): Promise<string> {
@@ -334,7 +464,19 @@ async function main(): Promise<void> {
     [0, 1, 6, 24, 72, 168], "min");
 }
 
-main().catch((err) => {
-  console.error("FATAL", err);
-  process.exit(1);
-});
+// Only run main() when executed directly, not when imported as a library.
+const isMainModule = (() => {
+  try {
+    const entry = process.argv[1] ?? "";
+    return entry.endsWith("_okxFilterAnalysis.ts") || entry.endsWith("_okxFilterAnalysis.js");
+  } catch {
+    return false;
+  }
+})();
+
+if (isMainModule) {
+  main().catch((err) => {
+    console.error("FATAL", err);
+    process.exit(1);
+  });
+}

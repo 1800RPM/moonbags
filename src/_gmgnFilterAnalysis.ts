@@ -231,14 +231,70 @@ function median(xs: number[]): number {
   return ((sorted[m - 1] ?? 0) + (sorted[m] ?? 0)) / 2;
 }
 
-function summarize(label: string, group: Candidate[]): string {
-  if (group.length === 0) return `  ${label.padEnd(40)} n=0`;
+export type GmgnSweepSummary = {
+  n: number;
+  winPct: number;
+  medianMaxPnl: number;
+  medianFinalPnl: number;
+  medianMinPnl: number;
+};
+
+export type GmgnSweepRow = GmgnSweepSummary & { threshold: number; kept: number; dropped: number };
+
+export type GmgnSweepResult = {
+  field: string;
+  label: string;
+  dir: "min" | "max";
+  baseline: GmgnSweepSummary;
+  rows: GmgnSweepRow[];
+};
+
+export type GmgnBySourceSummary = GmgnSweepSummary & { tfLabel: string };
+
+export type GmgnFilterAnalysisResult = {
+  totalTokens: number;
+  withOhlcv: number;
+  byTimeFrame: GmgnBySourceSummary[];
+  sweeps: GmgnSweepResult[];
+  csvPath: string;
+};
+
+function summarizeGroup(group: Candidate[]): GmgnSweepSummary {
+  if (group.length === 0) return { n: 0, winPct: 0, medianMaxPnl: 0, medianFinalPnl: 0, medianMinPnl: 0 };
   const wins = group.filter((c) => c.maxPnLPct >= WINNER_THRESHOLD_PCT).length;
-  const winRate = (wins / group.length) * 100;
-  const medMax = median(group.map((c) => c.maxPnLPct));
-  const medFinal = median(group.map((c) => c.finalPnLPct));
-  const medMin = median(group.map((c) => c.minPnLPct));
-  return `  ${label.padEnd(40)} n=${String(group.length).padStart(3)}  win@50%=${winRate.toFixed(0).padStart(3)}%  medMax=${medMax >= 0 ? "+" : ""}${medMax.toFixed(0)}%  medFinal=${medFinal >= 0 ? "+" : ""}${medFinal.toFixed(0)}%  medMin=${medMin.toFixed(0)}%`;
+  return {
+    n: group.length,
+    winPct: (wins / group.length) * 100,
+    medianMaxPnl: median(group.map((c) => c.maxPnLPct)),
+    medianFinalPnl: median(group.map((c) => c.finalPnLPct)),
+    medianMinPnl: median(group.map((c) => c.minPnLPct)),
+  };
+}
+
+function summarize(label: string, group: Candidate[]): string {
+  const s = summarizeGroup(group);
+  if (s.n === 0) return `  ${label.padEnd(40)} n=0`;
+  return `  ${label.padEnd(40)} n=${String(s.n).padStart(3)}  win@50%=${s.winPct.toFixed(0).padStart(3)}%  medMax=${s.medianMaxPnl >= 0 ? "+" : ""}${s.medianMaxPnl.toFixed(0)}%  medFinal=${s.medianFinalPnl >= 0 ? "+" : ""}${s.medianFinalPnl.toFixed(0)}%  medMin=${s.medianMinPnl.toFixed(0)}%`;
+}
+
+function computeSweep(
+  label: string,
+  candidates: Candidate[],
+  field: keyof Candidate,
+  thresholds: number[],
+  dir: "min" | "max",
+): GmgnSweepResult {
+  const baseline = summarizeGroup(candidates);
+  const rows: GmgnSweepRow[] = thresholds.map((t) => {
+    const kept = candidates.filter((c) => {
+      const v = c[field] as number;
+      return dir === "min" ? v >= t : v <= t;
+    });
+    const dropped = candidates.length - kept.length;
+    const s = summarizeGroup(kept);
+    return { threshold: t, kept: kept.length, dropped, ...s };
+  });
+  return { field: String(field), label, dir, baseline, rows };
 }
 
 function sweepThreshold(
@@ -258,6 +314,85 @@ function sweepThreshold(
     const dropped = candidates.length - kept.length;
     console.log(`${summarize(`${field} ${direction === "min" ? ">=" : "<="} ${t} (drops ${dropped})`, kept)}`);
   }
+}
+
+const GMGN_SWEEP_SPECS: Array<{ label: string; field: keyof Candidate; thresholds: number[]; dir: "min" | "max" }> = [
+  { label: "liquidityUsd (current default: 10,000)", field: "liquidityUsd", thresholds: [0, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000], dir: "min" },
+  { label: "holders (current default: 200)", field: "holders", thresholds: [0, 50, 100, 200, 500, 1_000, 2_000], dir: "min" },
+  { label: "top10Pct (current default: 45)", field: "top10Pct", thresholds: [100, 80, 60, 50, 45, 40, 35, 30, 25, 20], dir: "max" },
+  { label: "rugRatio (current default: 0.35)", field: "rugRatio", thresholds: [1, 0.5, 0.35, 0.2, 0.1, 0.05], dir: "max" },
+  { label: "bundlerPct (current default: 50)", field: "bundlerPct", thresholds: [100, 80, 60, 50, 40, 30, 20, 10], dir: "max" },
+  { label: "creatorBalancePct (current default: 20)", field: "creatorBalancePct", thresholds: [100, 50, 30, 20, 15, 10, 5], dir: "max" },
+];
+
+export async function runGmgnFilterAnalysis(opts?: {
+  onProgress?: (stage: string, pct: number) => void;
+}): Promise<GmgnFilterAnalysisResult> {
+  const onProgress = opts?.onProgress;
+  if (!isGmgnConfigured()) {
+    throw new Error("GMGN_API_KEY not set in env");
+  }
+
+  onProgress?.("harvesting candidates", 0);
+  const candidates = await harvestCandidates();
+  onProgress?.(`harvested ${candidates.length} candidates`, 10);
+
+  if (candidates.length === 0) {
+    return {
+      totalTokens: 0,
+      withOhlcv: 0,
+      byTimeFrame: [],
+      sweeps: [],
+      csvPath: "",
+    };
+  }
+
+  let enriched = 0;
+  for (const c of candidates) {
+    await enrichCandidate(c);
+    enriched++;
+    if (enriched % 5 === 0 || enriched === candidates.length) {
+      const pct = 10 + Math.round((enriched / candidates.length) * 30);
+      onProgress?.(`enriched ${enriched}/${candidates.length}`, pct);
+    }
+  }
+
+  let withOhlcv = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    if (!c) continue;
+    const candles = await fetchKlines(c.mint);
+    computeForwardPnL(c, candles);
+    if (c.hasOhlcv) withOhlcv++;
+    if (i % 5 === 0 || i === candidates.length - 1) {
+      const pct = 40 + Math.round(((i + 1) / candidates.length) * 55);
+      onProgress?.(`OHLCV ${i + 1}/${candidates.length} (hasData=${withOhlcv})`, pct);
+    }
+  }
+
+  const csvPath = await writeCsv(candidates);
+  onProgress?.("computing sweeps", 97);
+
+  const usable = candidates.filter((c) => c.hasOhlcv);
+
+  const byTimeFrame: GmgnBySourceSummary[] = (["signal", "trenches", "trending"] as const).map((src) => {
+    const group = usable.filter((c) => c.source === src);
+    return { tfLabel: src, ...summarizeGroup(group) };
+  });
+
+  const sweeps: GmgnSweepResult[] = GMGN_SWEEP_SPECS.map((spec) =>
+    computeSweep(spec.label, usable, spec.field, spec.thresholds, spec.dir),
+  );
+
+  onProgress?.("done", 100);
+
+  return {
+    totalTokens: candidates.length,
+    withOhlcv,
+    byTimeFrame,
+    sweeps,
+    csvPath,
+  };
 }
 
 async function writeCsv(candidates: Candidate[]): Promise<string> {
@@ -354,7 +489,19 @@ async function main(): Promise<void> {
   console.log(summarize("isWashTrading=false", usable.filter((c) => !c.isWashTrading)));
 }
 
-main().catch((err) => {
-  console.error("FATAL", err);
-  process.exit(1);
-});
+// Only run main() when executed directly, not when imported as a library.
+const isMainModule = (() => {
+  try {
+    const entry = process.argv[1] ?? "";
+    return entry.endsWith("_gmgnFilterAnalysis.ts") || entry.endsWith("_gmgnFilterAnalysis.js");
+  } catch {
+    return false;
+  }
+})();
+
+if (isMainModule) {
+  main().catch((err) => {
+    console.error("FATAL", err);
+    process.exit(1);
+  });
+}
