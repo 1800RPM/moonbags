@@ -2238,6 +2238,222 @@ function registerFilterAdopt(
   return key;
 }
 
+// ---------------------------------------------------------------------------
+// Share / Import — compact base64 payload for exchanging filter+exit settings
+// ---------------------------------------------------------------------------
+type SharePayload = {
+  v: 1;
+  jupGate: { minFees: number; allowedScoreLabels: string[]; minOrganicVolumePct: number; minOrganicBuyersPct: number };
+  buy: { sizeSol: number };
+  exit: {
+    profitStrategyType: string;
+    fixedTargetPct: number;
+    ladderTargets: Array<{ pnlPct: number; sellPct: number }>;
+    trailRemainder: boolean;
+    armPct: number;
+    trailPct: number;
+    stopPct: number;
+    maxHoldSecs: number;
+    runnerKeepPct: number;
+    runnerTrailPct: number;
+    runnerTimeoutSecs: number;
+  };
+  milestones: { enabled: boolean; pcts: number[] };
+  okxBaseline: Record<string, number | boolean>;
+  okxTrigger: Record<string, number>;
+  gmgnBaseline: Record<string, number | boolean>;
+  gmgnTrigger: Record<string, number>;
+};
+
+const SHARE_ADOPT_TTL_MS = 60 * 60 * 1000;
+const pendingSharedAdopts = new Map<string, SharePayload>();
+
+function registerSharedAdopt(payload: SharePayload): string {
+  const now = Date.now();
+  // Prune expired entries.
+  for (const [k, v] of pendingSharedAdopts) {
+    if (now - (v as unknown as { _at: number })._at > SHARE_ADOPT_TTL_MS) pendingSharedAdopts.delete(k);
+  }
+  const key = Math.random().toString(36).slice(2, 10);
+  // Attach expiry timestamp out-of-band.
+  (payload as unknown as { _at: number })._at = now;
+  pendingSharedAdopts.set(key, payload);
+  return key;
+}
+
+function buildSharePayload(): SharePayload {
+  const s = getRuntimeSettings();
+  return {
+    v: 1,
+    jupGate: {
+      minFees: s.jupGate.minFees,
+      allowedScoreLabels: s.jupGate.allowedScoreLabels,
+      minOrganicVolumePct: s.jupGate.minOrganicVolumePct,
+      minOrganicBuyersPct: s.jupGate.minOrganicBuyersPct,
+    },
+    buy: { sizeSol: s.buy.sizeSol },
+    exit: {
+      profitStrategyType: s.exit.profitStrategy.type,
+      fixedTargetPct: s.exit.profitStrategy.fixedTargetPct,
+      ladderTargets: s.exit.profitStrategy.ladderTargets,
+      trailRemainder: s.exit.profitStrategy.trailRemainder,
+      armPct: s.exit.trail.armPct,
+      trailPct: s.exit.trail.trailPct,
+      stopPct: s.exit.risk.stopPct,
+      maxHoldSecs: s.exit.risk.maxHoldSecs,
+      runnerKeepPct: s.exit.runner.keepPct,
+      runnerTrailPct: s.exit.runner.trailPct,
+      runnerTimeoutSecs: s.exit.runner.timeoutSecs,
+    },
+    milestones: { enabled: s.milestones.enabled, pcts: s.milestones.pcts },
+    okxBaseline: s.signals.okx.discovery.baseline as unknown as Record<string, number | boolean>,
+    okxTrigger: s.signals.okx.discovery.trigger as unknown as Record<string, number>,
+    gmgnBaseline: s.signals.gmgn.baseline as unknown as Record<string, number | boolean>,
+    gmgnTrigger: s.signals.gmgn.trigger as unknown as Record<string, number>,
+  };
+}
+
+function formatShareSummary(p: SharePayload): string {
+  const labelsText = p.jupGate.allowedScoreLabels.length > 0
+    ? p.jupGate.allowedScoreLabels.join(", ")
+    : "any";
+  const ladderText = p.exit.ladderTargets.length > 0
+    ? p.exit.ladderTargets.map(t => `${(t.pnlPct * 100).toFixed(0)}%:${(t.sellPct * 100).toFixed(0)}%`).join(", ")
+    : "—";
+  return (
+    `<b>JupGate</b>  minFees=${p.jupGate.minFees}  orgVol≥${p.jupGate.minOrganicVolumePct}%  orgBuyers≥${p.jupGate.minOrganicBuyersPct}%\n` +
+    `          labels: ${escapeHtml(labelsText)}\n` +
+    `<b>Buy</b>      ${p.buy.sizeSol} SOL\n` +
+    `<b>Exit</b>     strategy=${escapeHtml(p.exit.profitStrategyType)}  arm=${(p.exit.armPct * 100).toFixed(0)}%  trail=${(p.exit.trailPct * 100).toFixed(0)}%  stop=${(p.exit.stopPct * 100).toFixed(0)}%\n` +
+    (p.exit.ladderTargets.length > 0 ? `          ladder: ${escapeHtml(ladderText)}\n` : ``) +
+    `          runner: keep=${(p.exit.runnerKeepPct * 100).toFixed(0)}%  trail=${(p.exit.runnerTrailPct * 100).toFixed(0)}%  timeout=${Math.round(p.exit.runnerTimeoutSecs / 60)}m\n` +
+    `<b>OKX</b>      holders≥${(p.okxBaseline as Record<string, number>).minHolders ?? "?"}  liq≥${(p.okxBaseline as Record<string, number>).minLiquidityUsd ?? "?"}\n` +
+    `<b>GMGN</b>     holders≥${(p.gmgnBaseline as Record<string, number>).minHolders ?? "?"}  liq≥${(p.gmgnBaseline as Record<string, number>).minLiquidityUsd ?? "?"}`
+  );
+}
+
+async function handleShare(chatId: number): Promise<void> {
+  const payload = buildSharePayload();
+  const encoded = "MB1:" + Buffer.from(JSON.stringify(payload)).toString("base64");
+  const adoptKey = registerSharedAdopt(payload);
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `<b>📤 Share your MoonBags settings</b>\n\n` +
+      formatShareSummary(payload) + `\n\n` +
+      `<b>Payload (send with /import):</b>\n<code>${escapeHtml(encoded)}</code>`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ Adopt (apply to this bot)", callback_data: `adopt:import:${adoptKey}` },
+      ]],
+    },
+  });
+}
+
+async function handleImport(chatId: number, argText: string): Promise<void> {
+  const raw = argText.trim();
+  if (!raw) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "Usage: <code>/import MB1:&lt;base64&gt;</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  const b64 = raw.startsWith("MB1:") ? raw.slice(4) : raw;
+  let payload: SharePayload;
+  try {
+    payload = JSON.parse(Buffer.from(b64, "base64").toString("utf8")) as SharePayload;
+  } catch {
+    await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Could not decode payload — check it was copied in full." });
+    return;
+  }
+  if (payload.v !== 1 || (!payload.jupGate && !payload.okxBaseline)) {
+    await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Invalid payload (must have v:1 and jupGate or okxBaseline)." });
+    return;
+  }
+  const adoptKey = registerSharedAdopt(payload);
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `<b>📥 Imported settings preview</b>\n\n` +
+      formatShareSummary(payload) + `\n\n` +
+      `Tap the button to apply these settings live.`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ Adopt imported settings", callback_data: `adopt:import:${adoptKey}` },
+      ]],
+    },
+  });
+}
+
+async function applySharedAdopt(chatId: number, key: string): Promise<void> {
+  const entry = pendingSharedAdopts.get(key);
+  if (!entry) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "⚠️ Adopt link expired — run /share or /import again.",
+    });
+    return;
+  }
+  pendingSharedAdopts.delete(key);
+  const p = entry;
+
+  updateRuntimeSettings((draft) => {
+    // jupGate
+    draft.jupGate.minFees = p.jupGate.minFees;
+    draft.jupGate.allowedScoreLabels = p.jupGate.allowedScoreLabels;
+    draft.jupGate.minOrganicVolumePct = p.jupGate.minOrganicVolumePct;
+    draft.jupGate.minOrganicBuyersPct = p.jupGate.minOrganicBuyersPct;
+    // buy
+    draft.buy.sizeSol = p.buy.sizeSol;
+    // exit
+    draft.exit.profitStrategy.type = p.exit.profitStrategyType as typeof draft.exit.profitStrategy.type;
+    draft.exit.profitStrategy.fixedTargetPct = p.exit.fixedTargetPct;
+    draft.exit.profitStrategy.ladderTargets = p.exit.ladderTargets;
+    draft.exit.profitStrategy.trailRemainder = p.exit.trailRemainder;
+    draft.exit.trail.armPct = p.exit.armPct;
+    draft.exit.trail.trailPct = p.exit.trailPct;
+    draft.exit.risk.stopPct = p.exit.stopPct;
+    draft.exit.risk.maxHoldSecs = p.exit.maxHoldSecs;
+    draft.exit.runner.keepPct = p.exit.runnerKeepPct;
+    draft.exit.runner.trailPct = p.exit.runnerTrailPct;
+    draft.exit.runner.timeoutSecs = p.exit.runnerTimeoutSecs;
+    // milestones
+    draft.milestones.enabled = p.milestones.enabled;
+    draft.milestones.pcts = p.milestones.pcts;
+    // baselines & triggers
+    if (p.okxBaseline) {
+      const tgt = draft.signals.okx.discovery.baseline as unknown as Record<string, number | boolean>;
+      for (const [k, v] of Object.entries(p.okxBaseline)) tgt[k] = v;
+    }
+    if (p.okxTrigger) {
+      const tgt = draft.signals.okx.discovery.trigger as unknown as Record<string, number>;
+      for (const [k, v] of Object.entries(p.okxTrigger)) tgt[k] = v;
+    }
+    if (p.gmgnBaseline) {
+      const tgt = draft.signals.gmgn.baseline as unknown as Record<string, number | boolean>;
+      for (const [k, v] of Object.entries(p.gmgnBaseline)) tgt[k] = v;
+    }
+    if (p.gmgnTrigger) {
+      const tgt = draft.signals.gmgn.trigger as unknown as Record<string, number>;
+      for (const [k, v] of Object.entries(p.gmgnTrigger)) tgt[k] = v;
+    }
+  });
+
+  logger.info({ key }, "[settings] shared payload adopted");
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `✅ <b>Shared settings adopted</b>\n\n` +
+      formatShareSummary(p) + `\n\n` +
+      `<i>Applied live, persisted to state/settings.json. No restart needed.</i>`,
+    parse_mode: "HTML",
+  });
+}
+
 const TELEGRAM_SOFT_LIMIT = 3800;
 
 type NormalizedSweep = {
@@ -2850,6 +3066,10 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
     await tgPost("sendMessage", { chat_id: chatId, text: "❌ Cancelled. Config unchanged." });
     return;
   }
+  if (parts[1] === "import") {
+    await applySharedAdopt(chatId, parts[2] ?? "");
+    return;
+  }
   if (parts[1] === "filter") {
     const key = parts[2];
     const entry = key ? pendingFilterAdopts.get(key) : undefined;
@@ -3227,6 +3447,8 @@ export function startTelegramBot(): () => void {
       { command: "doctor",    description: "Run setup and runtime health checks" },
       { command: "setup_status", description: "Show setup checklist" },
       { command: "update",    description: "Pull latest code and restart via pm2" },
+      { command: "share",     description: "Share your filter/exit settings as a compact payload" },
+      { command: "import",    description: "Import shared settings: /import MB1:<payload>" },
     ],
   });
 
@@ -3320,6 +3542,8 @@ export function startTelegramBot(): () => void {
               case "/doctor":    await handleDoctor(chatId); break;
               case "/setup_status": await handleSetupStatus(chatId); break;
               case "/update":    await handleUpdate(chatId); break;
+              case "/share":     await handleShare(chatId); break;
+              case "/import":    await handleImport(chatId, argText); break;
             }
           } catch (err) {
             logger.warn({ err: (err as Error).message, cmd }, "[telegram] command handler threw");
