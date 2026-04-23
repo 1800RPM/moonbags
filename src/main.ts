@@ -8,7 +8,11 @@ import { startTelegramBot } from "./telegramBot.js";
 import { notifyBoot } from "./notifier.js";
 import { unwrapResidualWsol } from "./jupClient.js";
 import { startOkxWsService, stopOkxWsService, watchOkxWsMint } from "./okxWsService.js";
-import { startOkxSignalSource, stopOkxSignalSource } from "./okxSignalSource.js";
+// [OKX-KOL-RETIRED 2026-04-22] The KOL signal source (src/okxSignalSource.ts)
+// is kept on disk but no longer started. It is replaced by the SCG-alpha-style
+// discovery source wired in below. Re-enable by restoring the start call.
+import { stopOkxSignalSource } from "./okxSignalSource.js";
+import { startOkxDiscoverySource, stopOkxDiscoverySource } from "./okxDiscoverySource.js";
 import { startGmgnSignalSource, stopGmgnSignalSource } from "./gmgnSignalSource.js";
 import { CONFIG } from "./config.js";
 import logger from "./logger.js";
@@ -54,12 +58,12 @@ async function main(): Promise<void> {
   for (const position of getPositions().filter((p) => p.status === "open")) {
     void watchOkxWsMint(position.mint);
   }
-  startOkxSignalSource({
+  startOkxDiscoverySource({
     onAcceptedCandidate: async (alert) => {
       try {
         await openPosition(alert);
       } catch (e) {
-        logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed for OKX signal");
+        logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed for OKX discovery signal");
       }
     },
   });
@@ -120,7 +124,12 @@ async function main(): Promise<void> {
     stopTelegram();
     clearInterval(tickInterval);
     clearInterval(llmInterval);
-    void Promise.allSettled([stopOkxWsService(), stopOkxSignalSource(), stopGmgnSignalSource()])
+    void Promise.allSettled([
+        stopOkxWsService(),
+        stopOkxSignalSource(),
+        stopOkxDiscoverySource(),
+        stopGmgnSignalSource(),
+      ])
       .then((results) => {
         for (const result of results) {
           if (result.status === "rejected") logger.warn({ err: String(result.reason) }, "[shutdown] source stop failed");

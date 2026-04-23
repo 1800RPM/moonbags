@@ -80,12 +80,16 @@ const BACKTEST_LADDER_PRESETS: Record<string, BacktestTpTarget[]> = {
 // [SCG-DISABLED 2026-04-22] "scg_only" removed from active SOURCE_MODES so the
 // telegram UI no longer offers it. Restore the scg_only entry when re-enabling SCG.
 const SOURCE_MODES: SourceMode[] = [/* "scg_only", */ "okx_watch", "hybrid", "okx_only", "gmgn_watch", "gmgn_live", "gmgn_only"];
-const OKX_SIGNAL_SOURCE_MODULE = "./okxSignalSource.js";
+// [OKX-KOL-RETIRED 2026-04-22] /sources now reads from the SCG-alpha-style
+// discovery source (src/okxDiscoverySource.ts) instead of the legacy KOL
+// signal source. Swap this module path back to "./okxSignalSource.js" and
+// point the accessors at get/refresh OkxSignalSource to restore the old view.
+const OKX_SIGNAL_SOURCE_MODULE = "./okxDiscoverySource.js";
 const GMGN_SIGNAL_SOURCE_MODULE = "./gmgnSignalSource.js";
 
 type OkxSignalSourceModule = {
-  getOkxSignalStatus?: () => unknown | Promise<unknown>;
-  refreshOkxSignalSource?: () => void | Promise<void>;
+  getOkxDiscoveryStatus?: () => unknown | Promise<unknown>;
+  refreshOkxDiscoverySource?: () => void | Promise<void>;
 };
 
 type GmgnSignalSourceModule = {
@@ -132,11 +136,11 @@ async function loadOkxSignalSource(): Promise<OkxSignalSourceModule | null> {
 
 async function getSafeOkxSignalStatus(): Promise<OkxSignalStatusResult> {
   const mod = await loadOkxSignalSource();
-  if (!mod?.getOkxSignalStatus) {
-    return { available: false, error: "src/okxSignalSource.ts not loaded yet" };
+  if (!mod?.getOkxDiscoveryStatus) {
+    return { available: false, error: "src/okxDiscoverySource.ts not loaded yet" };
   }
   try {
-    return { available: true, status: await mod.getOkxSignalStatus() };
+    return { available: true, status: await mod.getOkxDiscoveryStatus() };
   } catch (err) {
     return { available: false, error: (err as Error)?.message ?? String(err) };
   }
@@ -144,11 +148,11 @@ async function getSafeOkxSignalStatus(): Promise<OkxSignalStatusResult> {
 
 async function refreshSafeOkxSignalSource(): Promise<OkxSignalStatusResult> {
   const mod = await loadOkxSignalSource();
-  if (!mod?.refreshOkxSignalSource) {
-    return { available: false, error: "src/okxSignalSource.ts not loaded yet" };
+  if (!mod?.refreshOkxDiscoverySource) {
+    return { available: false, error: "src/okxDiscoverySource.ts not loaded yet" };
   }
   try {
-    await mod.refreshOkxSignalSource();
+    await mod.refreshOkxDiscoverySource();
     return getSafeOkxSignalStatus();
   } catch (err) {
     return { available: false, error: (err as Error)?.message ?? String(err) };
@@ -963,13 +967,12 @@ function okxDiscoveryStatusLines(result: OkxSignalStatusResult): string[] {
   }
   const status = result.status;
   const enabled = firstBoolean(status, [["enabled"]]);
-  const state =
-    firstString(status, [["state"], ["status"], ["mode"]]) ??
-    (enabled === false ? "disabled" : enabled === true ? "enabled" : "loaded");
-  const lastRefreshAt = firstNumber(status, [["lastRefreshAt"], ["lastScanAt"], ["lastTickAt"], ["lastRunAt"]]);
+  const running = firstBoolean(status, [["running"]]);
+  const configured = firstBoolean(status, [["configured"]]);
+  const lastRefreshAt = firstNumber(status, [["lastRefreshAt"], ["lastPollAt"], ["lastScanAt"], ["lastTickAt"], ["lastRunAt"]]);
   const lastError = firstString(status, [["lastError"], ["error"]]);
   const counts = okxStatusCounts(status);
-  const latest = firstObject(status, [["latestCandidate"], ["latest"], ["candidate"], ["latestSignal"], ["lastCandidate"]]);
+  const latest = firstObject(status, [["lastCandidate"], ["latestCandidate"], ["latest"], ["candidate"], ["latestSignal"]]);
   const rejection = firstString(status, [
     ["lastRejectionReason"],
     ["lastRejectReason"],
@@ -977,9 +980,21 @@ function okxDiscoveryStatusLines(result: OkxSignalStatusResult): string[] {
     ["lastRejected", "reason"],
     ["lastRejection", "reason"],
   ]);
+  const watched = firstNumber(status, [["watchedMints"], ["watchlist", "size"], ["watchlistSize"]]);
+  const minHolders = firstNumber(status, [["baseline", "minHolders"]]);
+  const minLiquidity = firstNumber(status, [["baseline", "minLiquidityUsd"]]);
+  const maxTop10 = firstNumber(status, [["baseline", "maxTop10HolderRate"], ["baseline", "maxTop10Pct"]]);
+  const minScans = firstNumber(status, [["trigger", "minScans"]]);
+  const holderGrowth = firstNumber(status, [["trigger", "minHolderGrowthPct"]]);
+  const state = enabled === false
+    ? "disabled"
+    : configured === false
+      ? "missing OKX creds"
+      : `okx_discovery${running === false ? " idle" : " running"}`;
   const lines = [
-    `• status: ${escapeHtml(state)}${lastRefreshAt ? ` · last refresh ${formatAgo(Date.now() - lastRefreshAt)}` : ""}`,
-    `• live buy filter: ${escapeHtml(formatOkxLiveFilter(status))}`,
+    `• status: ${escapeHtml(state)}${lastRefreshAt ? ` · last scan ${formatAgo(Date.now() - lastRefreshAt)}` : ""}`,
+    `• baseline: holders ≥ ${formatLooseCount(minHolders)} · liq ≥ ${minLiquidity == null ? "—" : fmtMcap(minLiquidity)}${maxTop10 != null ? ` · top10 ≤ ${maxTop10 > 1 ? maxTop10.toFixed(0) : (maxTop10 * 100).toFixed(0)}%` : ""}`,
+    `• tracking: ${formatLooseCount(watched)} watched · ${formatLooseCount(minScans)} scans · holder growth ≥ ${holderGrowth == null ? "—" : `${holderGrowth}%`}`,
     `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
     `• latest candidate: ${formatLooseCandidate(latest)}`,
     `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,

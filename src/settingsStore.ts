@@ -63,6 +63,38 @@ export type RuntimeSettings = {
         walletTypes: number[];
         minAmountUsd: number;
       };
+      // [OKX-DISCOVERY 2026-04-22] SCG-alpha-style discovery source config —
+      // consumed by src/okxDiscoverySource.ts. Mirrors signals.gmgn shape so
+      // the /sources UI can render both sources uniformly.
+      discovery: {
+        enabled: boolean;
+        pollMs: number;
+        mintCooldownMins: number;
+        watchlistTtlMins: number;
+        maxWatchMints: number;
+        seedLimit: number;
+        timeFrame: string;
+        rankBy: string;
+        includeBundleInfo: boolean;
+        baseline: {
+          minHolders: number;
+          minLiquidityUsd: number;
+          minMcapUsd: number;
+          maxMcapUsd: number;
+          maxTop10HolderRate: number;
+          maxRugRatio: number;
+          maxBundlerRate: number;
+          maxBotRate: number;
+          maxCreatorBalanceRate: number;
+          requireNotWashTrading: boolean;
+        };
+        trigger: {
+          minScans: number;
+          minHolderGrowthPct: number;
+          maxLiquidityDropPct: number;
+          minBuySellRatio: number;
+        };
+      };
     };
     gmgn: {
       enabled: boolean;
@@ -185,6 +217,35 @@ function defaultSettings(): RuntimeSettings {
           // winrate to 45% with medFinal -5% on the OKX signal stream.
           minAmountUsd: 500,
         },
+        discovery: {
+          enabled: true,
+          pollMs: 30_000,
+          mintCooldownMins: 60,
+          watchlistTtlMins: 180,
+          maxWatchMints: 120,
+          seedLimit: 100,
+          timeFrame: "1",
+          rankBy: "5",
+          includeBundleInfo: false,
+          baseline: {
+            minHolders: 200,
+            minLiquidityUsd: 10_000,
+            minMcapUsd: 0,
+            maxMcapUsd: 0,
+            maxTop10HolderRate: 0.5,
+            maxRugRatio: 0.3,
+            maxBundlerRate: 0.5,
+            maxBotRate: 0.5,
+            maxCreatorBalanceRate: 0.2,
+            requireNotWashTrading: true,
+          },
+          trigger: {
+            minScans: 2,
+            minHolderGrowthPct: 5,
+            maxLiquidityDropPct: 30,
+            minBuySellRatio: 1.15,
+          },
+        },
       },
       gmgn: {
         enabled: false,
@@ -282,6 +343,15 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   const okxEntryFilter = (
     okxSignals.entryFilter && typeof okxSignals.entryFilter === "object" ? okxSignals.entryFilter : {}
   ) as Record<string, unknown>;
+  const okxDiscovery = (
+    okxSignals.discovery && typeof okxSignals.discovery === "object" ? okxSignals.discovery : {}
+  ) as Record<string, unknown>;
+  const okxDiscoveryBaseline = (
+    okxDiscovery.baseline && typeof okxDiscovery.baseline === "object" ? okxDiscovery.baseline : {}
+  ) as Record<string, unknown>;
+  const okxDiscoveryTrigger = (
+    okxDiscovery.trigger && typeof okxDiscovery.trigger === "object" ? okxDiscovery.trigger : {}
+  ) as Record<string, unknown>;
   const gmgnSignals = (signals.gmgn && typeof signals.gmgn === "object" ? signals.gmgn : {}) as Record<string, unknown>;
   const gmgnBaseline = (
     gmgnSignals.baseline && typeof gmgnSignals.baseline === "object" ? gmgnSignals.baseline : {}
@@ -361,6 +431,39 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
           minHolders: Math.round(num(okxEntryFilter.minHolders, defaults.signals.okx.entryFilter.minHolders, 0, 1_000_000_000)),
           walletTypes: normalizeNumberList(okxEntryFilter.walletTypes, defaults.signals.okx.entryFilter.walletTypes, 1, 99),
           minAmountUsd: num(okxEntryFilter.minAmountUsd, defaults.signals.okx.entryFilter.minAmountUsd, 0, 1_000_000_000),
+        },
+        discovery: {
+          enabled: bool(okxDiscovery.enabled, defaults.signals.okx.discovery.enabled),
+          pollMs: Math.round(num(okxDiscovery.pollMs, defaults.signals.okx.discovery.pollMs, 15_000, 600_000)),
+          mintCooldownMins: num(okxDiscovery.mintCooldownMins, defaults.signals.okx.discovery.mintCooldownMins, 0, 1440),
+          watchlistTtlMins: num(okxDiscovery.watchlistTtlMins, defaults.signals.okx.discovery.watchlistTtlMins, 5, 1440 * 7),
+          maxWatchMints: Math.round(num(okxDiscovery.maxWatchMints, defaults.signals.okx.discovery.maxWatchMints, 10, 1000)),
+          seedLimit: Math.round(num(okxDiscovery.seedLimit, defaults.signals.okx.discovery.seedLimit, 10, 100)),
+          timeFrame: typeof okxDiscovery.timeFrame === "string" && okxDiscovery.timeFrame.trim()
+            ? okxDiscovery.timeFrame.trim()
+            : defaults.signals.okx.discovery.timeFrame,
+          rankBy: typeof okxDiscovery.rankBy === "string" && okxDiscovery.rankBy.trim()
+            ? okxDiscovery.rankBy.trim()
+            : defaults.signals.okx.discovery.rankBy,
+          includeBundleInfo: bool(okxDiscovery.includeBundleInfo, defaults.signals.okx.discovery.includeBundleInfo),
+          baseline: {
+            minHolders: Math.round(num(okxDiscoveryBaseline.minHolders, defaults.signals.okx.discovery.baseline.minHolders, 0, 1_000_000_000)),
+            minLiquidityUsd: num(okxDiscoveryBaseline.minLiquidityUsd, defaults.signals.okx.discovery.baseline.minLiquidityUsd, 0),
+            minMcapUsd: num(okxDiscoveryBaseline.minMcapUsd, defaults.signals.okx.discovery.baseline.minMcapUsd, 0),
+            maxMcapUsd: num(okxDiscoveryBaseline.maxMcapUsd, defaults.signals.okx.discovery.baseline.maxMcapUsd, 0),
+            maxTop10HolderRate: num(okxDiscoveryBaseline.maxTop10HolderRate, defaults.signals.okx.discovery.baseline.maxTop10HolderRate, 0, 1),
+            maxRugRatio: num(okxDiscoveryBaseline.maxRugRatio, defaults.signals.okx.discovery.baseline.maxRugRatio, 0, 1),
+            maxBundlerRate: num(okxDiscoveryBaseline.maxBundlerRate, defaults.signals.okx.discovery.baseline.maxBundlerRate, 0, 1),
+            maxBotRate: num(okxDiscoveryBaseline.maxBotRate, defaults.signals.okx.discovery.baseline.maxBotRate, 0, 1),
+            maxCreatorBalanceRate: num(okxDiscoveryBaseline.maxCreatorBalanceRate, defaults.signals.okx.discovery.baseline.maxCreatorBalanceRate, 0, 1),
+            requireNotWashTrading: bool(okxDiscoveryBaseline.requireNotWashTrading, defaults.signals.okx.discovery.baseline.requireNotWashTrading),
+          },
+          trigger: {
+            minScans: Math.round(num(okxDiscoveryTrigger.minScans, defaults.signals.okx.discovery.trigger.minScans, 1, 20)),
+            minHolderGrowthPct: num(okxDiscoveryTrigger.minHolderGrowthPct, defaults.signals.okx.discovery.trigger.minHolderGrowthPct, 0, 1000),
+            maxLiquidityDropPct: num(okxDiscoveryTrigger.maxLiquidityDropPct, defaults.signals.okx.discovery.trigger.maxLiquidityDropPct, 0, 100),
+            minBuySellRatio: num(okxDiscoveryTrigger.minBuySellRatio, defaults.signals.okx.discovery.trigger.minBuySellRatio, 0, 1000),
+          },
         },
       },
       gmgn: {
