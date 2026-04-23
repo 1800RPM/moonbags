@@ -321,12 +321,16 @@ function normalizeTargets(value: unknown, fallback: TpTarget[]): TpTarget[] {
   return targets.length > 0 ? targets : fallback;
 }
 
-function normalizeStringList(value: unknown, fallback: string[]): string[] {
+function normalizeStringList(value: unknown, fallback: string[], allowEmpty = false): string[] {
   if (!Array.isArray(value)) return fallback;
   const items = value
     .map((item) => (typeof item === "string" ? item.trim() : ""))
     .filter((item) => item.length > 0);
-  return items.length > 0 ? Array.from(new Set(items)) : fallback;
+  if (items.length > 0) return Array.from(new Set(items));
+  // An explicitly empty array is meaningful for some fields (e.g.
+  // jupGate.allowedScoreLabels: [] means "any label"). Only fall back
+  // to defaults when the caller opts in.
+  return allowEmpty ? [] : fallback;
 }
 
 function normalizeNumberList(value: unknown, fallback: number[], min = -Infinity, max = Infinity): number[] {
@@ -517,7 +521,7 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
     jupGate: {
       enabled: bool(jupGate.enabled, defaults.jupGate.enabled),
       minFees: num(jupGate.minFees, defaults.jupGate.minFees, 0, 1_000_000_000),
-      allowedScoreLabels: normalizeStringList(jupGate.allowedScoreLabels, defaults.jupGate.allowedScoreLabels),
+      allowedScoreLabels: normalizeStringList(jupGate.allowedScoreLabels, defaults.jupGate.allowedScoreLabels, true),
     },
   };
 }
