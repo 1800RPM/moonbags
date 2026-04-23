@@ -4,6 +4,7 @@ import logger from "./logger.js";
 import type { ScgAlert } from "./types.js";
 import { checkSignalMintCooldown, markSignalMintAccepted } from "./sourceDedupe.js";
 import { getRuntimeSettings } from "./settingsStore.js";
+import { fetchJupAudit, passesJupGate } from "./jupGate.js";
 import { isBlacklisted, isPaused, recordAlertEvent } from "./scgPoller.js";
 import {
   getMarketSignal,
@@ -1260,15 +1261,22 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
   return sortAndLimitSeeds(scored, settings.maxCandidatesPerPoll);
 }
 
+type DeepDiveResult =
+  | { ok: true; candidate: GmgnSignalCandidate }
+  | { ok: false; reason: string };
+
 // Deep-dive enrichment: called just before a candidate would emit, after
 // baseline + trigger have already passed on the seed-level data. Pulls
 // /v1/token/info + /v1/token/security in parallel and fills ONLY missing
 // fields on the candidate (does not override richer seed data). Callers
 // should re-check baseline filters on the returned candidate.
 //
-// Returns null if either request throws — the safer behavior is to drop
-// the candidate rather than fire on partial data.
-async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<GmgnSignalCandidate | null> {
+// Also applies the GLOBAL Jupiter datapi audit gate (fees + organicScoreLabel)
+// before emit — Jup transient failures default to pass (see src/jupGate.ts).
+//
+// Returns { ok:false, reason } if either request throws (safer to drop than
+// fire on partial data) or the Jup gate rejects.
+async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveResult> {
   let info: Record<string, unknown> | null = null;
   let security: Record<string, unknown> | null = null;
   try {
@@ -1283,7 +1291,7 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<GmgnSignalC
       { err: (err as Error).message, mint: seed.mint, source: seed.source },
       "[gmgn-source] deep-dive request failed — dropping candidate",
     );
-    return null;
+    return { ok: false, reason: "request failed" };
   }
 
   const next: GmgnSignalCandidate = { ...seed, sourceMeta: { ...seed.sourceMeta } };
@@ -1353,7 +1361,24 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<GmgnSignalC
   next.alert = buildAlert(next);
   next.alert.score = next.score;
   next.alert.sourceMeta = next.sourceMeta;
-  return next;
+
+  // Global Jup audit gate — applied AFTER enrichment so all sources share
+  // the same fees + organicScoreLabel floor. Transient Jup failures pass.
+  const jupCfg = getRuntimeSettings().jupGate;
+  const audit = await fetchJupAudit(seed.mint);
+  const gate = passesJupGate(audit, jupCfg);
+  if (!gate.ok) {
+    return { ok: false, reason: gate.reason };
+  }
+  if (audit) {
+    next.sourceMeta = {
+      ...next.sourceMeta,
+      jupAudit: audit,
+    };
+    next.alert.sourceMeta = next.sourceMeta;
+  }
+
+  return { ok: true, candidate: next };
 }
 
 async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): Promise<void> {
@@ -1415,12 +1440,14 @@ async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): P
   // candidate would otherwise fire. This backfills any fields missing
   // from the seed (holders, liquidity, rug_ratio, top10, bundler,
   // is_wash_trading) and gives us a last chance to reject bad tokens.
-  const enriched = await deepDiveCandidate(seed);
-  if (!enriched) {
-    reject(seed, seed.source, "deep-dive: request failed");
-    upsertWatchEntry(seed, "filtered", "deep-dive: request failed");
+  const deepDive = await deepDiveCandidate(seed);
+  if (!deepDive.ok) {
+    const reason = `deep-dive: ${deepDive.reason}`;
+    reject(seed, seed.source, reason);
+    upsertWatchEntry(seed, "filtered", reason);
     return;
   }
+  const enriched = deepDive.candidate;
   // Reuse lastCandidate so /sources-status reflects the enriched numbers.
   lastCandidate = enriched;
   const deepDiveReason = maybeReject(enriched, "deep-dive");

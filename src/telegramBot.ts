@@ -30,6 +30,7 @@ import {
   type UpdatePreview,
 } from "./updateManager.js";
 import { formatDoctorHtml, runDoctor, type DoctorReport } from "./doctor.js";
+import { formatJupGate } from "./jupGate.js";
 import type { Position } from "./types.js";
 import {
   formatTpTargets,
@@ -1001,10 +1002,12 @@ function okxDiscoveryStatusLines(result: OkxSignalStatusResult): string[] {
     : configured === false
       ? "missing OKX creds"
       : `okx_discovery${running === false ? " idle" : " running"}`;
+  const jupCfg = getRuntimeSettings().jupGate;
   const lines = [
     `• status: ${escapeHtml(state)}${lastRefreshAt ? ` · last scan ${formatAgo(Date.now() - lastRefreshAt)}` : ""}`,
     `• baseline: holders ≥ ${formatLooseCount(minHolders)} · liq ≥ ${minLiquidity == null ? "—" : fmtMcap(minLiquidity)}${maxTop10 != null ? ` · top10 ≤ ${maxTop10 > 1 ? maxTop10.toFixed(0) : (maxTop10 * 100).toFixed(0)}%` : ""}`,
     `• tracking: ${formatLooseCount(watched)} watched · ${formatLooseCount(minScans)} scans · holder growth ≥ ${holderGrowth == null ? "—" : `${holderGrowth}%`}`,
+    `• Jup gate: ${escapeHtml(formatJupGate(jupCfg))}`,
     `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
     `• latest candidate: ${formatLooseCandidate(latest)}`,
     `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,
@@ -1040,10 +1043,12 @@ function gmgnDiscoveryStatusLines(result: GmgnSignalStatusResult): string[] {
     : configured === false
       ? "missing GMGN_API_KEY"
       : `${mode ?? "gmgn"}${running === false ? " idle" : " running"}`;
+  const jupCfg = getRuntimeSettings().jupGate;
   const lines = [
     `• status: ${escapeHtml(state)}${lastScanAt ? ` · last scan ${formatAgo(Date.now() - lastScanAt)}` : ""}`,
     `• baseline: holders ≥ ${formatLooseCount(minHolders)} · liq ≥ ${minLiquidity == null ? "—" : fmtMcap(minLiquidity)}${maxTop10 != null ? ` · top10 ≤ ${maxTop10 > 1 ? maxTop10.toFixed(0) : (maxTop10 * 100).toFixed(0)}%` : ""}`,
     `• tracking: ${formatLooseCount(watched)} watched · ${formatLooseCount(minScans)} scans · holder growth ≥ ${holderGrowth == null ? "—" : `${holderGrowth}%`}`,
+    `• Jup gate: ${escapeHtml(formatJupGate(jupCfg))}`,
     `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
     `• latest candidate: ${formatLooseCandidate(latest)}`,
     `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,

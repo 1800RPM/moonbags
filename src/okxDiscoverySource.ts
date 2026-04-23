@@ -25,6 +25,7 @@ import logger from "./logger.js";
 import type { ScgAlert } from "./types.js";
 import { checkSignalMintCooldown, markSignalMintAccepted } from "./sourceDedupe.js";
 import { getRuntimeSettings } from "./settingsStore.js";
+import { fetchJupAudit, passesJupGate } from "./jupGate.js";
 import { isBlacklisted, isPaused, recordAlertEvent } from "./scgPoller.js";
 import {
   getMaybeBool,
@@ -909,7 +910,11 @@ async function fetchSeeds(settings: OkxDiscoverySettings): Promise<OkxDiscoveryC
 // ---------------------------------------------------------------------------
 // Deep dive (just before emit)
 // ---------------------------------------------------------------------------
-async function deepDiveCandidate(seed: OkxDiscoveryCandidate): Promise<OkxDiscoveryCandidate | null> {
+type OkxDeepDiveResult =
+  | { ok: true; candidate: OkxDiscoveryCandidate }
+  | { ok: false; reason: string };
+
+async function deepDiveCandidate(seed: OkxDiscoveryCandidate): Promise<OkxDeepDiveResult> {
   const settings = currentSettings();
   let advanced: Record<string, unknown> | null = null;
   let bundle: Record<string, unknown> | null = null;
@@ -927,13 +932,13 @@ async function deepDiveCandidate(seed: OkxDiscoveryCandidate): Promise<OkxDiscov
       { err: (err as Error).message, mint: seed.mint },
       "[okx-discovery] deep-dive (advanced-info) threw — dropping candidate",
     );
-    return null;
+    return { ok: false, reason: "request failed" };
   }
 
   if (!advanced) {
     // Request returned no data / not-ok — safer to drop than to fire with
     // seed-only numbers that might have been masked by deep-dive checks.
-    return null;
+    return { ok: false, reason: "request failed" };
   }
 
   if (settings.includeBundleInfo) {
@@ -998,7 +1003,24 @@ async function deepDiveCandidate(seed: OkxDiscoveryCandidate): Promise<OkxDiscov
   next.alert = buildAlert(next);
   next.alert.score = next.score;
   next.alert.sourceMeta = next.sourceMeta;
-  return next;
+
+  // Global Jup audit gate — applied AFTER enrichment so all sources share
+  // the same fees + organicScoreLabel floor. Transient Jup failures pass.
+  const jupCfg = getRuntimeSettings().jupGate;
+  const audit = await fetchJupAudit(seed.mint);
+  const gate = passesJupGate(audit, jupCfg);
+  if (!gate.ok) {
+    return { ok: false, reason: gate.reason };
+  }
+  if (audit) {
+    next.sourceMeta = {
+      ...next.sourceMeta,
+      jupAudit: audit,
+    };
+    next.alert.sourceMeta = next.sourceMeta;
+  }
+
+  return { ok: true, candidate: next };
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,12 +1069,14 @@ async function processSeed(seed: OkxDiscoveryCandidate, settings: OkxDiscoverySe
     return;
   }
 
-  const enriched = await deepDiveCandidate(seed);
-  if (!enriched) {
-    reject(seed, seed.source, "deep-dive: request failed");
-    upsertWatchEntry(seed, "filtered", "deep-dive: request failed");
+  const deepDive = await deepDiveCandidate(seed);
+  if (!deepDive.ok) {
+    const reason = `deep-dive: ${deepDive.reason}`;
+    reject(seed, seed.source, reason);
+    upsertWatchEntry(seed, "filtered", reason);
     return;
   }
+  const enriched = deepDive.candidate;
   lastCandidate = enriched;
 
   const deepDiveReason = maybeReject(enriched);

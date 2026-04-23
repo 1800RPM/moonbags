@@ -131,6 +131,13 @@ export type RuntimeSettings = {
       channels: string[];
     };
   };
+  // [JUP-GATE 2026-04-22] Global Jup datapi audit gate applied during
+  // deep-dive by both GMGN and OKX discovery sources. See src/jupGate.ts.
+  jupGate: {
+    enabled: boolean;
+    minFees: number;
+    allowedScoreLabels: string[];
+  };
 };
 
 export const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
@@ -282,6 +289,11 @@ function defaultSettings(): RuntimeSettings {
         channels: ["price-info", "trades", "dex-token-candle1m"],
       },
     },
+    jupGate: {
+      enabled: true,
+      minFees: 1,
+      allowedScoreLabels: ["medium", "high"],
+    },
   };
 }
 
@@ -361,6 +373,7 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   ) as Record<string, unknown>;
   const marketData = (root.marketData && typeof root.marketData === "object" ? root.marketData : {}) as Record<string, unknown>;
   const wss = (marketData.wss && typeof marketData.wss === "object" ? marketData.wss : {}) as Record<string, unknown>;
+  const jupGate = (root.jupGate && typeof root.jupGate === "object" ? root.jupGate : {}) as Record<string, unknown>;
 
   const rawType = profit.type;
   const type: ExitStrategyMode =
@@ -500,6 +513,11 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
         triggerTickMs: Math.round(num(wss.triggerTickMs, defaults.marketData.wss.triggerTickMs, 250, 60_000)),
         channels: normalizeStringList(wss.channels, defaults.marketData.wss.channels),
       },
+    },
+    jupGate: {
+      enabled: bool(jupGate.enabled, defaults.jupGate.enabled),
+      minFees: num(jupGate.minFees, defaults.jupGate.minFees, 0, 1_000_000_000),
+      allowedScoreLabels: normalizeStringList(jupGate.allowedScoreLabels, defaults.jupGate.allowedScoreLabels),
     },
   };
 }
