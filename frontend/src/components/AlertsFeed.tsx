@@ -36,6 +36,25 @@ export function AlertsFeed({ alerts, closedTrades = [], tokenInfo = {}, loading 
   }, [closedTrades]);
 
   const visible = alerts.filter((a) => a.action !== "dedup");
+  const seenKeys = new Set<string>();
+  const deduped = visible.filter((a) => {
+    const closed = closedByMint.get(a.mint);
+    const key = closed
+      ? `closed:${a.mint}:${closed.closedAt}`
+      : a.action === "fired"
+        ? `fired:${a.mint}`
+        : a.action === "filtered"
+          ? `filtered:${a.mint}`
+          : `${a.action}:${a.mint}:${a.at}`;
+    if (seenKeys.has(key)) return false;
+    seenKeys.add(key);
+    return true;
+  });
+  const actionable = deduped.filter((a) => a.action === "fired" || closedByMint.has(a.mint));
+  const filtered = deduped.filter((a) => a.action === "filtered" && !closedByMint.has(a.mint));
+  const filteredBudget = actionable.length > 0 ? 10 : 18;
+  const hiddenFilteredCount = Math.max(0, filtered.length - filteredBudget);
+  const feedItems = [...actionable, ...filtered.slice(0, filteredBudget)];
 
   if (loading) {
     return (
@@ -45,7 +64,7 @@ export function AlertsFeed({ alerts, closedTrades = [], tokenInfo = {}, loading 
     );
   }
 
-  if (visible.length === 0) {
+  if (feedItems.length === 0) {
     return (
       <div className="flex items-center justify-center h-32 text-muted-foreground font-mono text-xs uppercase tracking-widest border border-outline-variant/10 bg-surface-container-low rounded-md">
         Silent night 🌙
@@ -60,7 +79,19 @@ export function AlertsFeed({ alerts, closedTrades = [], tokenInfo = {}, loading 
       aria-live="polite"
       aria-label="Recent alerts"
     >
-      {visible.map((a, i) => (
+      {(actionable.length > 0 || hiddenFilteredCount > 0) && (
+        <div className="sticky top-0 z-10 rounded-sm border border-outline-variant/10 bg-background/90 px-3 py-2 backdrop-blur">
+          <div className="flex items-center justify-between gap-3 font-mono text-[10px] uppercase tracking-widest">
+            <span className="text-foreground">
+              {actionable.length} actionable
+            </span>
+            <span className="text-muted-foreground">
+              {hiddenFilteredCount > 0 ? `${hiddenFilteredCount} filtered hidden` : "filtered de-emphasized"}
+            </span>
+          </div>
+        </div>
+      )}
+      {feedItems.map((a, i) => (
         <AlertItem
           key={`${a.at}-${a.mint}-${i}`}
           a={a}
@@ -128,7 +159,7 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
 
   return (
     <div
-      className={`p-3 bg-surface-container-low border-l-2 ${borderClass} flex items-start justify-between rounded-r-sm ${filtered ? "opacity-70" : ""}`}
+      className={`p-3 bg-surface-container-low border-l-2 ${borderClass} flex items-start justify-between rounded-r-sm ${filtered ? "opacity-60" : ""}`}
     >
       <div className="flex items-start gap-2 min-w-0">
         <TokenAvatar icon={info?.icon} name={a.name} size={24} />

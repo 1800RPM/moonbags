@@ -33,6 +33,13 @@ export function heroBars(closed: ClosedTrade[]): number[] {
   return buildBars(series, 8);
 }
 
+export function heroSeries(closed: ClosedTrade[]): number[] {
+  if (!closed.length) return [];
+  const sorted = [...closed].sort((a, b) => a.closedAt - b.closedAt);
+  let acc = 0;
+  return sorted.map((t) => (acc += t.pnlSol));
+}
+
 type SparkBarsProps = {
   bars: number[];
   className?: string;
@@ -53,6 +60,74 @@ export function SparkBars({ bars, className = "", barClassName = "" }: SparkBars
         />
       ))}
     </div>
+  );
+}
+
+type SparkLineProps = {
+  values: number[];
+  width?: number;
+  height?: number;
+  strokeClassName?: string;
+  areaClassName?: string;
+  className?: string;
+};
+
+export function SparkLine({
+  values,
+  width = 480,
+  height = 180,
+  strokeClassName = "stroke-pepe",
+  areaClassName = "fill-pepe/10",
+  className = "",
+}: SparkLineProps) {
+  if (values.length < 2) {
+    return <div className={className} />;
+  }
+
+  const padding = 10;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(1e-9, max - min);
+  const stepX = (width - padding * 2) / Math.max(1, values.length - 1);
+  const points = values.map((value, index) => {
+    const x = padding + index * stepX;
+    const normalized = (value - min) / span;
+    const y = height - padding - normalized * (height - padding * 2);
+    return [x, y] as const;
+  });
+
+  const polyline = points.map(([x, y]) => `${x},${y}`).join(" ");
+  const area = [
+    `M ${points[0]?.[0]} ${height - padding}`,
+    ...points.map(([x, y]) => `L ${x} ${y}`),
+    `L ${points[points.length - 1]?.[0]} ${height - padding}`,
+    "Z",
+  ].join(" ");
+  const last = points[points.length - 1];
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className={className}
+      aria-label={`PnL line chart, ${values.length} points`}
+      role="img"
+    >
+      <path d={area} className={areaClassName} />
+      <polyline
+        points={polyline}
+        fill="none"
+        className={strokeClassName}
+        strokeWidth="3"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+      {last && (
+        <>
+          <circle cx={last[0]} cy={last[1]} r="5" className="fill-pepe" />
+          <circle cx={last[0]} cy={last[1]} r="10" className="fill-pepe/20" />
+        </>
+      )}
+    </svg>
   );
 }
 
