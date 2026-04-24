@@ -107,6 +107,7 @@ export const CONFIG = ({
   TELEGRAM_BOT_TOKEN: str("TELEGRAM_BOT_TOKEN") ?? "",
   TELEGRAM_CHAT_ID: str("TELEGRAM_CHAT_ID") ?? "",
   LLM_EXIT_ENABLED: bool("LLM_EXIT_ENABLED", false),
+  LLM_ENTRY_ENABLED: bool("LLM_ENTRY_ENABLED", false),
   LLM_POLL_MS: num("LLM_POLL_MS", 30_000),
   OKX_WSS_ENABLED: bool("OKX_WSS_ENABLED", false),
   // LLM provider — defaults to MiniMax for backwards compat.
@@ -139,6 +140,7 @@ export type SettableKey =
   | "STOP_PCT"
   | "MAX_HOLD_SECS"
   | "LLM_EXIT_ENABLED"
+  | "LLM_ENTRY_ENABLED"
   | "MILESTONES_ENABLED"
   | "MILESTONE_PCTS"
   | "MOONBAG_PCT"
@@ -198,6 +200,11 @@ export const SETTABLE_SPECS: Record<SettableKey, Spec> = {
     },
   },
   LLM_EXIT_ENABLED: {
+    type: "boolean",
+    validate: (v) => (typeof v === "boolean" ? null : "must be true/false"),
+    display: (v) => (v ? "🤖 ON" : "⚪️ OFF"),
+  },
+  LLM_ENTRY_ENABLED: {
     type: "boolean",
     validate: (v) => (typeof v === "boolean" ? null : "must be true/false"),
     display: (v) => (v ? "🤖 ON" : "⚪️ OFF"),

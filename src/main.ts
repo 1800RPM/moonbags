@@ -15,6 +15,7 @@ import { stopOkxSignalSource } from "./okxSignalSource.js";
 import { startOkxDiscoverySource, stopOkxDiscoverySource } from "./okxDiscoverySource.js";
 import { startGmgnSignalSource, stopGmgnSignalSource } from "./gmgnSignalSource.js";
 import { CONFIG } from "./config.js";
+import { consultEntry } from "./llmEntryAdvisor.js";
 import logger from "./logger.js";
 
 async function main(): Promise<void> {
@@ -61,6 +62,13 @@ async function main(): Promise<void> {
   startOkxDiscoverySource({
     onAcceptedCandidate: async (alert) => {
       try {
+        if (CONFIG.LLM_ENTRY_ENABLED) {
+          const decision = await consultEntry(alert);
+          if (decision.action === "skip") {
+            logger.info({ mint: alert.mint, name: alert.name, reason: decision.reason }, "[llm-entry] skipped OKX signal");
+            return;
+          }
+        }
         await openPosition(alert);
       } catch (e) {
         logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed for OKX discovery signal");
@@ -70,6 +78,13 @@ async function main(): Promise<void> {
   startGmgnSignalSource({
     onAcceptedCandidate: async (alert) => {
       try {
+        if (CONFIG.LLM_ENTRY_ENABLED) {
+          const decision = await consultEntry(alert);
+          if (decision.action === "skip") {
+            logger.info({ mint: alert.mint, name: alert.name, reason: decision.reason }, "[llm-entry] skipped GMGN signal");
+            return;
+          }
+        }
         await openPosition(alert);
       } catch (e) {
         logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed for GMGN signal");
