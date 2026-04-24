@@ -42,55 +42,61 @@ export function BottomConfigStrip({ config, botUsername, exitSettings }: Props) 
     },
   } : undefined);
   return (
-    <footer className="fixed bottom-0 inset-x-0 h-12 z-50 bg-background border-t border-pepe/10 flex justify-between items-center px-4 shadow-[0_-8px_32px_rgba(107,170,52,0.08)]">
-      <div className="flex items-center gap-6 overflow-x-auto no-scrollbar whitespace-nowrap">
-        {config ? (
-          <>
-            <Pill label="BUY" value={`${config.BUY_SIZE_SOL} SOL`} />
-            <Pill
-              label="EXIT"
-              value={exit ? exitMode(exit) : "—"}
-              tone="pepe"
-            />
-            <Pill label="RISK" value={exit ? `S-${pct(exit.risk.stopPct)} H${hold(exit.risk.maxHoldSecs)}` : "—"} tone="coral" />
-            <Pill
-              label="MOON"
-              value={exit ? moonbag(exit.runner.keepPct, exit.runner.trailPct, exit.runner.timeoutSecs) : "—"}
-              tone="earth"
-            />
-            <Pill label="LLM" value={exit?.llm.enabled ? "🤖 ON" : "OFF"} tone={exit?.llm.enabled ? "earth" : "muted"} />
-            <Pill
-              label="DRY"
-              value={config.DRY_RUN ? "TRUE" : "FALSE"}
-              tone={config.DRY_RUN ? "earth" : undefined}
-            />
-          </>
-        ) : (
-          <span className="text-muted-foreground font-mono text-[10px] uppercase tracking-widest">
-            Loading config…
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-2 shrink-0 ml-4">
-        <Send className="w-3.5 h-3.5 text-earth" aria-hidden="true" />
-        {telegramUrl ? (
-          <a
-            href={telegramUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-earth font-mono text-[10px] font-bold tracking-widest uppercase hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-earth"
-            title={`Open @${botUsername} on Telegram — then type /settings`}
-          >
-            EDIT IN TELEGRAM /settings
-          </a>
-        ) : (
-          <span
-            className="text-muted-foreground font-mono text-[10px] font-bold tracking-widest uppercase cursor-default"
-            title="Telegram bot not configured"
-          >
-            EDIT IN TELEGRAM /settings
-          </span>
-        )}
+    <footer className="fixed bottom-0 inset-x-0 z-50 bg-background/95 backdrop-blur-xl border-t border-pepe/10 shadow-[0_-8px_32px_rgba(107,170,52,0.08)]">
+      <div className="mx-auto flex max-w-[1440px] flex-col gap-2 px-3 py-2 md:h-12 md:flex-row md:items-center md:justify-between md:px-4 md:py-0">
+        <div className="overflow-x-auto no-scrollbar whitespace-nowrap">
+          <div className="flex items-center gap-4 md:gap-6 min-w-max">
+            {config ? (
+              <>
+                <Pill label="BUY" value={`${config.BUY_SIZE_SOL} SOL`} />
+                <Pill
+                  label="EXIT"
+                  value={exit ? exitMode(exit) : "—"}
+                  tone="pepe"
+                />
+                <Pill label="RISK" value={exit ? `S-${pct(exit.risk.stopPct)} H${hold(exit.risk.maxHoldSecs)}` : "—"} tone="coral" />
+                <Pill
+                  label="MOON"
+                  value={exit ? moonbag(exit.runner.keepPct, exit.runner.trailPct, exit.runner.timeoutSecs) : "—"}
+                  tone="earth"
+                />
+                <Pill label="LLM" value={exit?.llm.enabled ? "🤖 ON" : "OFF"} tone={exit?.llm.enabled ? "earth" : "muted"} />
+                <Pill
+                  label="DRY"
+                  value={config.DRY_RUN ? "TRUE" : "FALSE"}
+                  tone={config.DRY_RUN ? "earth" : undefined}
+                />
+              </>
+            ) : (
+              <span className="text-muted-foreground font-mono text-[10px] uppercase tracking-widest">
+                Loading config…
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center justify-between gap-2 shrink-0 md:ml-4">
+          <Send className="w-3.5 h-3.5 text-earth" aria-hidden="true" />
+          {telegramUrl ? (
+            <a
+              href={telegramUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-earth font-mono text-[10px] font-bold tracking-widest uppercase hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-earth"
+              title={`Open @${botUsername} on Telegram — then type /settings`}
+            >
+              <span className="md:hidden">Telegram /settings</span>
+              <span className="hidden md:inline">Edit in Telegram /settings</span>
+            </a>
+          ) : (
+            <span
+              className="text-muted-foreground font-mono text-[10px] font-bold tracking-widest uppercase cursor-default"
+              title="Telegram bot not configured"
+            >
+              <span className="md:hidden">Telegram unavailable</span>
+              <span className="hidden md:inline">Edit in Telegram /settings</span>
+            </span>
+          )}
+        </div>
       </div>
     </footer>
   );

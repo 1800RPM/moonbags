@@ -1,6 +1,8 @@
 export interface ScgAlert {
   mint: string;
   name: string;
+  source?: "scg" | "okx" | string;
+  sourceMeta?: Record<string, unknown>;
   logo?: string;
   score: number;
   alert_time: number;
@@ -40,6 +42,7 @@ export interface SignalMeta {
   rug_ratio: number;
   liq_trend: string;
   score: number;
+  source?: string;
 }
 
 export interface ScgAlertsResponse {

@@ -57,6 +57,13 @@ body::before {
   background: radial-gradient(circle at center, rgba(150, 217, 93, 0.10) 0%, transparent 70%);
 }
 
+.hero-grid {
+  background-image:
+    linear-gradient(rgba(146, 198, 76, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(146, 198, 76, 0.05) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
 /* Hide scrollbar utility for the bottom strip */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { scrollbar-width: none; }

@@ -48,7 +48,7 @@ export default function App() {
         <TopBar state={state} error={error} />
 
         {/* Main content — pad for the fixed top bar (56px) and bottom strip (48px) */}
-        <main className="pt-[72px] pb-16 min-h-screen px-4 md:px-6 max-w-[1440px] mx-auto w-full space-y-6">
+        <main className="pt-[72px] pb-28 md:pb-16 min-h-screen px-4 md:px-6 max-w-[1440px] mx-auto w-full space-y-6">
           {/* Hero — big PnL number + KPI tiles */}
           <HeroSection state={state} />
 

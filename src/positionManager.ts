@@ -8,6 +8,7 @@ import { getBatchPricesParallel, getPriceViaSellQuote } from "./priceFeed.js";
 import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyTakeProfitPartial, notifyMilestone } from "./notifier.js";
 import { consultLlm, type LlmContext } from "./llmExitAdvisor.js";
 import { getPositionSnapshot } from "./okxClient.js";
+import { getOkxWsOverlay, unwatchOkxWsMint, watchOkxWsMint } from "./okxWsService.js";
 import { getRuntimeSettings, type TpTarget } from "./settingsStore.js";
 import {
   appendLlmTradeRecord,
@@ -139,11 +140,20 @@ export interface McapTierStat {
   medianPnlPct: number;
 }
 
+export interface SourceStat {
+  source: string;
+  count: number;
+  winRate: number;
+  avgPnlPct: number;
+  medianPnlPct: number;
+}
+
 export interface SignalStats {
   totalTrades: number;
   mcap: { mean: number; median: number; mode: number | null; min: number; max: number; stdev: number };
   byMcapTier: McapTierStat[];
   bestMcapTier: McapTierStat | null;
+  bySource: SourceStat[];
   correlations: Record<string, number>;
   activeFilter: { mcapMin: number; mcapMax: number };
 }
@@ -194,6 +204,27 @@ export async function getSignalStats(): Promise<SignalStats> {
     correlations[field] = _spearson(xs, pnls);
   }
 
+  const sources = new Map<string, ClosedTrade[]>();
+  for (const t of withMeta) {
+    const src = (t.signalMeta?.source ?? "scg").toLowerCase();
+    const bucket = sources.get(src) ?? [];
+    bucket.push(t);
+    sources.set(src, bucket);
+  }
+  const bySource: SourceStat[] = [...sources.entries()]
+    .map(([source, trades]) => {
+      const pnlVals = trades.map((t) => t.pnlPct);
+      const wins = trades.filter((t) => t.pnlPct > 0).length;
+      return {
+        source,
+        count: trades.length,
+        winRate: trades.length > 0 ? wins / trades.length : 0,
+        avgPnlPct: trades.length > 0 ? _smean(pnlVals) : 0,
+        medianPnlPct: trades.length > 0 ? _smedian(pnlVals) : 0,
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+
   const { alertFilter } = getRuntimeSettings();
   return {
     totalTrades: withMeta.length,
@@ -207,6 +238,7 @@ export async function getSignalStats(): Promise<SignalStats> {
     },
     byMcapTier,
     bestMcapTier,
+    bySource,
     correlations,
     activeFilter: { mcapMin: alertFilter.mcapMin, mcapMax: alertFilter.mcapMax },
   };
@@ -496,10 +528,12 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
       rug_ratio:    alert.rug_ratio,
       liq_trend:    alert.liq_trend,
       score:        alert.score,
+      source:       alert.source ?? "scg",
     },
   };
   positions.set(alert.mint, position);
   await flushPersist();
+  void watchOkxWsMint(alert.mint);
 
   logger.info(
     {
@@ -516,6 +550,8 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
   void notifyBuy({
     name: alert.name,
     mint: alert.mint,
+    source: alert.source ?? "scg",
+    sourceMeta: alert.sourceMeta,
     solSpent: position.entrySolSpent,
     entryMcap: alert.alert_mcap,
     entryPrice: entryPricePerTokenSol,
@@ -1212,6 +1248,7 @@ async function closePosition(mint: string, reason: CloseReason): Promise<void> {
 }
 
 function scheduleCleanup(mint: string): void {
+  void unwatchOkxWsMint(mint);
   setTimeout(() => {
     const p = positions.get(mint);
     if (p && (p.status === "closed" || p.status === "failed")) {
@@ -1300,6 +1337,19 @@ async function consultOnePosition(position: Position): Promise<void> {
     return null;
   });
   if (!snapshot) return;
+  const realtimeOverlay = getOkxWsOverlay(position.mint);
+  if (realtimeOverlay) {
+    snapshot.realtimeOverlay = {
+      lastEventAgeSecs: realtimeOverlay.lastEventAt ? Math.floor((Date.now() - realtimeOverlay.lastEventAt) / 1000) : null,
+      lastPollAgeSecs: realtimeOverlay.lastPollAt ? Math.floor((Date.now() - realtimeOverlay.lastPollAt) / 1000) : null,
+      active: realtimeOverlay.active,
+      errorCount: realtimeOverlay.errorCount,
+      lastError: realtimeOverlay.lastError ?? null,
+      latestPriceInfo: realtimeOverlay.latestPriceInfo ?? null,
+      recentTrades: realtimeOverlay.recentTrades.slice(-20),
+      recentCandles1m: realtimeOverlay.recentCandles1m.slice(-20),
+    };
+  }
 
   const decision = await consultLlm(ctx, snapshot);
   if (!decision) return;   // null = fall back to existing trail logic for this poll

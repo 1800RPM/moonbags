@@ -16,8 +16,11 @@ import {
 } from "./scgPoller.js";
 import type { ScgAlertsResponse } from "./types.js";
 import { getPositionSnapshot } from "./okxClient.js";
+import { getOkxWsStatus, unwatchOkxWsMint, watchOkxWsMint } from "./okxWsService.js";
 import { escapeHtml } from "./notifier.js";
 import { runBacktest, type BacktestTpTarget } from "./_backtest.js";
+import { runOkxFilterAnalysis, type OkxFilterAnalysisResult, type SweepResult as OkxSweepResult, type CategoricalSweepResult as OkxCategoricalSweepResult } from "./_okxFilterAnalysis.js";
+import { runGmgnFilterAnalysis, type GmgnFilterAnalysisResult, type GmgnSweepResult, type GmgnCategoricalSweepResult } from "./_gmgnFilterAnalysis.js";
 import {
   getUpdateBlockerDetails,
   getUpdatePreview,
@@ -27,6 +30,8 @@ import {
   type UpdatePreview,
 } from "./updateManager.js";
 import { formatDoctorHtml, runDoctor, type DoctorReport } from "./doctor.js";
+import { fetchJupAudit, formatJupGate, type JupAudit } from "./jupGate.js";
+import { getTokenInfos, type TokenInfo } from "./jupTokensClient.js";
 import type { Position } from "./types.js";
 import {
   formatTpTargets,
@@ -34,9 +39,11 @@ import {
   parseTpTargetsInput,
   setExitStrategy,
   setTpTargets,
+  SOURCE_MODE_LABELS,
   syncRuntimeSettingsFromConfig,
   updateRuntimeSettings,
   type ExitStrategyMode,
+  type SourceMode,
 } from "./settingsStore.js";
 
 type Update = {
@@ -61,6 +68,11 @@ const pendingEdits = new Map<number, SettableKey>();
 type ExitTargetEdit = { kind: "tp_targets" };
 const pendingExitEdits = new Map<number, ExitTargetEdit>();
 
+// Runtime (state/settings.json) settings that live outside SETTABLE_SPECS. The
+// Live Settings menu renders these as extra rows with their own callbacks.
+type RuntimeSettableKey = "JUP_GATE_ENABLED" | "JUP_GATE_MIN_FEES" | "JUP_GATE_SCORE_LABELS" | "JUP_GATE_ORG_VOL" | "JUP_GATE_ORG_BUYERS";
+const pendingRuntimeEdits = new Map<number, RuntimeSettableKey>();
+
 const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
   trail: "🌙 Trail",
   fixed_tp: "🎯 Fixed TP",
@@ -74,6 +86,34 @@ const BACKTEST_LADDER_PRESETS: Record<string, BacktestTpTarget[]> = {
   runner: [{ pnlPct: 0.50, sellPct: 0.25 }, { pnlPct: 1.00, sellPct: 0.25 }, { pnlPct: 2.00, sellPct: 0.25 }],
 };
 
+// [SCG-DISABLED 2026-04-22] "scg_only" removed from active SOURCE_MODES so the
+// telegram UI no longer offers it. Restore the scg_only entry when re-enabling SCG.
+const SOURCE_MODES: SourceMode[] = [/* "scg_only", */ "okx_watch", "hybrid", "okx_only", "gmgn_watch", "gmgn_live", "gmgn_only"];
+// [OKX-KOL-RETIRED 2026-04-22] /sources now reads from the SCG-alpha-style
+// discovery source (src/okxDiscoverySource.ts) instead of the legacy KOL
+// signal source. Swap this module path back to "./okxSignalSource.js" and
+// point the accessors at get/refresh OkxSignalSource to restore the old view.
+const OKX_SIGNAL_SOURCE_MODULE = "./okxDiscoverySource.js";
+const GMGN_SIGNAL_SOURCE_MODULE = "./gmgnSignalSource.js";
+
+type OkxSignalSourceModule = {
+  getOkxDiscoveryStatus?: () => unknown | Promise<unknown>;
+  refreshOkxDiscoverySource?: () => void | Promise<void>;
+};
+
+type GmgnSignalSourceModule = {
+  getGmgnSignalStatus?: () => unknown | Promise<unknown>;
+  refreshGmgnSignalSource?: () => void | Promise<void>;
+};
+
+type OkxSignalStatusResult = {
+  available: boolean;
+  status?: unknown;
+  error?: string;
+};
+
+type GmgnSignalStatusResult = OkxSignalStatusResult;
+
 function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   const result = setConfigValueRaw(key, raw);
   if (result.ok) syncRuntimeSettingsFromConfig();
@@ -84,6 +124,98 @@ function toggleConfigValue(key: SettableKey): SetConfigResult {
   const result = toggleConfigValueRaw(key);
   if (result.ok) syncRuntimeSettingsFromConfig();
   return result;
+}
+
+function isSourceMode(value: string): value is SourceMode {
+  return SOURCE_MODES.includes(value as SourceMode);
+}
+
+async function loadOkxSignalSource(): Promise<OkxSignalSourceModule | null> {
+  try {
+    return (await import(OKX_SIGNAL_SOURCE_MODULE)) as OkxSignalSourceModule;
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ERR_MODULE_NOT_FOUND" && code !== "MODULE_NOT_FOUND") {
+      logger.warn({ err: msg }, "[okx-signal] failed to load source module");
+    }
+    return null;
+  }
+}
+
+async function getSafeOkxSignalStatus(): Promise<OkxSignalStatusResult> {
+  const mod = await loadOkxSignalSource();
+  if (!mod?.getOkxDiscoveryStatus) {
+    return { available: false, error: "src/okxDiscoverySource.ts not loaded yet" };
+  }
+  try {
+    return { available: true, status: await mod.getOkxDiscoveryStatus() };
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
+}
+
+async function refreshSafeOkxSignalSource(): Promise<OkxSignalStatusResult> {
+  const mod = await loadOkxSignalSource();
+  if (!mod?.refreshOkxDiscoverySource) {
+    return { available: false, error: "src/okxDiscoverySource.ts not loaded yet" };
+  }
+  try {
+    await mod.refreshOkxDiscoverySource();
+    return getSafeOkxSignalStatus();
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
+}
+
+async function loadGmgnSignalSource(): Promise<GmgnSignalSourceModule | null> {
+  try {
+    return (await import(GMGN_SIGNAL_SOURCE_MODULE)) as GmgnSignalSourceModule;
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ERR_MODULE_NOT_FOUND" && code !== "MODULE_NOT_FOUND") {
+      logger.warn({ err: msg }, "[gmgn-signal] failed to load source module");
+    }
+    return null;
+  }
+}
+
+async function getSafeGmgnSignalStatus(): Promise<GmgnSignalStatusResult> {
+  const mod = await loadGmgnSignalSource();
+  if (!mod?.getGmgnSignalStatus) {
+    return { available: false, error: "src/gmgnSignalSource.ts not loaded yet" };
+  }
+  try {
+    return { available: true, status: await mod.getGmgnSignalStatus() };
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
+}
+
+async function refreshSafeGmgnSignalSource(): Promise<GmgnSignalStatusResult> {
+  const mod = await loadGmgnSignalSource();
+  if (!mod?.refreshGmgnSignalSource) {
+    return { available: false, error: "src/gmgnSignalSource.ts not loaded yet" };
+  }
+  try {
+    await mod.refreshGmgnSignalSource();
+    return getSafeGmgnSignalStatus();
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
+}
+
+async function setWssEnabled(enabled: boolean): Promise<void> {
+  updateRuntimeSettings((draft) => {
+    draft.marketData.wss.enabled = enabled;
+  });
+  const open = getPositions().filter((p) => p.status === "open");
+  if (enabled) {
+    await Promise.all(open.map((p) => watchOkxWsMint(p.mint)));
+  } else {
+    await Promise.all(open.map((p) => unwatchOkxWsMint(p.mint)));
+  }
 }
 
 function strategySummaryLines(): string[] {
@@ -168,19 +300,82 @@ async function tgPost(method: string, body: Record<string, unknown>): Promise<un
   return json;
 }
 
-function formatPosition(p: Position): string {
+function fmtUsd(n: number): string {
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
+  return `$${n.toFixed(4)}`;
+}
+
+function fmtPct(n: number): string {
+  return `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
+}
+
+function formatPosition(p: Position, info?: TokenInfo | null, audit?: JupAudit | null): string {
   const entry = p.entryPricePerTokenSol;
   const cur = p.currentPricePerTokenSol;
   const peak = p.peakPricePerTokenSol;
   const pnl = entry > 0 ? ((cur / entry) - 1) * 100 : 0;
   const drawdown = peak > 0 ? (1 - cur / peak) * 100 : 0;
-  const armed = p.armed ? " ⚡" : "";
   const icon = pnl >= 0 ? "🟢" : "🔴";
-  const mint = `${p.mint.slice(0, 4)}…${p.mint.slice(-4)}`;
-  return (
-    `${icon} <b>${escapeHtml(p.name)}</b>${armed}  <code>${escapeHtml(mint)}</code>\n` +
-    `   PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}%  peak: ${entry > 0 ? ((peak / entry - 1) * 100).toFixed(0) : "0"}%  pullback: ${drawdown.toFixed(1)}%`
-  );
+  const armed = p.armed ? " ⚡" : "";
+  const mintShort = `${p.mint.slice(0, 4)}…${p.mint.slice(-4)}`;
+  const gmgnUrl = `https://gmgn.ai/sol/token/${encodeURIComponent(p.mint)}`;
+  const source = p.signalMeta?.source;
+  const sourceTag = source ? ` <i>${escapeHtml(source)}</i>` : "";
+  const peakPct = entry > 0 ? ((peak / entry - 1) * 100).toFixed(0) : "0";
+  const sm = p.signalMeta;
+
+  const pnlSign = pnl >= 0 ? "+" : "";
+  const sep = " · ";
+
+  // Header: underlined token name + source + mint + gmgn
+  const header = `<u><b>${escapeHtml(p.name)}</b></u>${armed}${sourceTag}  <code>${escapeHtml(mintShort)}</code>  <a href="${gmgnUrl}">gmgn</a>`;
+
+  // PnL row: bold percentage + peak + drawdown with · separators
+  const pnlRow = `${icon} <b><u>${pnlSign}${pnl.toFixed(1)}%</u></b>${sep}▲ peak +${peakPct}%${sep}▼ dd ${drawdown.toFixed(1)}%`;
+
+  const lines: string[] = [header, pnlRow];
+
+  // Market data block (blockquote)
+  const marketLines: string[] = [];
+  if (info) {
+    const snap: string[] = [];
+    if (info.priceUsd > 0) snap.push(fmtUsd(info.priceUsd));
+    if (info.mcapUsd > 0) snap.push(`MCap ${fmtUsd(info.mcapUsd)}`);
+    if (info.liquidityUsd > 0) snap.push(`Liq ${fmtUsd(info.liquidityUsd)}`);
+    if (info.holderCount > 0) snap.push(`👥 ${info.holderCount.toLocaleString()}`);
+    if (info.organicScoreLabel) snap.push(`${escapeHtml(info.organicScoreLabel)}${info.verified ? " ✅" : ""}`);
+    if (snap.length > 0) marketLines.push(`📊 ${snap.join(sep)}`);
+
+    const mom: string[] = [];
+    const c5 = info.priceChange5m, c1h = info.priceChange1h, c24h = info.priceChange24h;
+    if (c5 !== 0 || c1h !== 0 || c24h !== 0) mom.push(`5m ${fmtPct(c5)}`, `1h ${fmtPct(c1h)}`, `24h ${fmtPct(c24h)}`);
+    const vol1h = info.buyVolume1h + info.sellVolume1h;
+    if (vol1h > 0) mom.push(`Vol ${fmtUsd(vol1h)}`);
+    if (info.numTraders1h > 0) mom.push(`${info.numBuys1h}↑ ${info.numSells1h}↓`);
+    if (audit?.organicVolumePct != null) mom.push(`orgVol ${audit.organicVolumePct.toFixed(0)}%`);
+    if (audit?.organicBuyersPct != null) mom.push(`orgBuyers ${audit.organicBuyersPct.toFixed(0)}%`);
+    if (mom.length > 0) marketLines.push(`📈 ${mom.join(sep)}`);
+  }
+  if (marketLines.length > 0) lines.push(`<blockquote>${marketLines.join("\n")}</blockquote>`);
+
+  // Risk block (expandable — collapsed by default)
+  const risk: string[] = [];
+  const top10 = info?.audit.topHoldersPercentage ?? (sm?.top10_pct ?? 0);
+  if (top10 > 0) risk.push(`top10 ${top10.toFixed(1)}%`);
+  if (sm?.bundler_pct != null && sm.bundler_pct > 0) risk.push(`bundler ${sm.bundler_pct.toFixed(0)}%`);
+  if (sm?.rug_ratio != null && sm.rug_ratio > 0) risk.push(`rug ${sm.rug_ratio.toFixed(2)}`);
+  if (audit?.fees != null && audit.fees > 0) risk.push(`fees ${audit.fees.toFixed(1)}`);
+  if (info) {
+    const a = info.audit;
+    if (!a.mintAuthorityDisabled) risk.push(`⚠️ mint`);
+    if (!a.freezeAuthorityDisabled) risk.push(`⚠️ freeze`);
+    if (a.devMints > 0) risk.push(`devMints ${a.devMints}`);
+    if (a.isSus) risk.push(`🚨 suspicious`);
+  }
+  if (risk.length > 0) lines.push(`<blockquote expandable>🔒 ${risk.join(sep)}</blockquote>`);
+
+  return lines.join("\n");
 }
 
 function sellButtons(positions: Position[]): Array<[{ text: string; callback_data: string }]> {
@@ -308,13 +503,34 @@ async function sendAllSettingsMenu(chatId: number): Promise<void> {
     return `${SETTINGS_LABELS[k]}: <b>${spec.display(v)}</b>`;
   });
 
-  const buttons = keys.map((k): [{ text: string; callback_data: string }] => {
+  const buttons: Array<Array<{ text: string; callback_data: string }>> = keys.map((k) => {
     const spec = SETTABLE_SPECS[k];
     if (spec.type === "boolean") {
       return [{ text: `Toggle ${SETTINGS_LABELS[k]}`, callback_data: `toggle:${k}` }];
     }
     return [{ text: `Edit ${SETTINGS_LABELS[k]}`, callback_data: `edit:${k}` }];
   });
+
+  // jupGate lives in runtime settings (state/settings.json), not env, so it
+  // isn't in SETTABLE_SPECS. Append it as three separate rows here so users
+  // can tune it from the same Live Settings screen.
+  const jupCfg = getRuntimeSettings().jupGate;
+  const jupEnabledDisplay = jupCfg.enabled ? "on" : "off";
+  const jupLabelsDisplay = jupCfg.allowedScoreLabels.length > 0
+    ? jupCfg.allowedScoreLabels.join(",")
+    : "(any)";
+  const jupOrgVolDisplay = jupCfg.minOrganicVolumePct > 0 ? `${jupCfg.minOrganicVolumePct}%` : "off";
+  const jupOrgBuyersDisplay = jupCfg.minOrganicBuyersPct > 0 ? `${jupCfg.minOrganicBuyersPct}%` : "off";
+  lines.push(`🔍 Jup gate: <b>${escapeHtml(jupEnabledDisplay)}</b>`);
+  lines.push(`🔍 Jup minFees: <b>${jupCfg.minFees}</b>`);
+  lines.push(`🔍 Jup score labels: <b>${escapeHtml(jupLabelsDisplay)}</b>`);
+  lines.push(`🔍 Jup organic vol %: <b>${jupOrgVolDisplay}</b>`);
+  lines.push(`🔍 Jup organic buyers %: <b>${jupOrgBuyersDisplay}</b>`);
+  buttons.push([{ text: `Toggle 🔍 Jup gate`, callback_data: "toggle:JUP_GATE_ENABLED" }]);
+  buttons.push([{ text: `Edit 🔍 Jup minFees`, callback_data: "edit:JUP_GATE_MIN_FEES" }]);
+  buttons.push([{ text: `Edit 🔍 Jup score labels`, callback_data: "edit:JUP_GATE_SCORE_LABELS" }]);
+  buttons.push([{ text: `Edit 🔍 Jup organic vol %`, callback_data: "edit:JUP_GATE_ORG_VOL" }]);
+  buttons.push([{ text: `Edit 🔍 Jup organic buyers %`, callback_data: "edit:JUP_GATE_ORG_BUYERS" }]);
 
   await tgPost("sendMessage", {
     chat_id: chatId,
@@ -378,6 +594,104 @@ async function applyEdit(chatId: number, key: SettableKey, raw: string): Promise
   logger.info({ key, value: v }, "[settings] updated via telegram");
 }
 
+// Runtime-settings (jupGate) edit prompt/apply. jupGate lives in
+// state/settings.json — not env — so it has a different persistence path
+// via updateRuntimeSettings.
+const RUNTIME_EDIT_LABELS: Record<RuntimeSettableKey, string> = {
+  JUP_GATE_ENABLED: "🔍 Jup gate",
+  JUP_GATE_MIN_FEES: "🔍 Jup minFees",
+  JUP_GATE_SCORE_LABELS: "🔍 Jup score labels",
+  JUP_GATE_ORG_VOL: "🔍 Jup organic vol %",
+  JUP_GATE_ORG_BUYERS: "🔍 Jup organic buyers %",
+};
+
+function formatRuntimeCurrent(key: RuntimeSettableKey): string {
+  const cfg = getRuntimeSettings().jupGate;
+  if (key === "JUP_GATE_ENABLED") return cfg.enabled ? "on" : "off";
+  if (key === "JUP_GATE_MIN_FEES") return String(cfg.minFees);
+  if (key === "JUP_GATE_ORG_VOL") return cfg.minOrganicVolumePct > 0 ? `${cfg.minOrganicVolumePct}%` : "off";
+  if (key === "JUP_GATE_ORG_BUYERS") return cfg.minOrganicBuyersPct > 0 ? `${cfg.minOrganicBuyersPct}%` : "off";
+  const labels = cfg.allowedScoreLabels;
+  return labels.length > 0 ? labels.join(",") : "(any)";
+}
+
+async function promptForRuntimeEdit(chatId: number, key: RuntimeSettableKey): Promise<void> {
+  const current = formatRuntimeCurrent(key);
+  const hint = key === "JUP_GATE_MIN_FEES"
+    ? `(number — e.g. 1 or 0.5)`
+    : key === "JUP_GATE_SCORE_LABELS"
+      ? `(comma-separated — e.g. "medium,high" or leave empty for any)`
+      : (key === "JUP_GATE_ORG_VOL" || key === "JUP_GATE_ORG_BUYERS")
+        ? `(0–100 — e.g. 5 for ≥5%; set 0 to disable)`
+        : "";
+  const resp = await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `Reply with the new value for <b>${RUNTIME_EDIT_LABELS[key]}</b>\n` +
+      `Current: <b>${escapeHtml(current)}</b>  ${hint}`,
+    parse_mode: "HTML",
+    reply_markup: { force_reply: true, selective: true },
+  }) as { ok?: boolean; result?: { message_id?: number } };
+
+  const promptId = resp?.result?.message_id;
+  if (typeof promptId === "number") {
+    pendingRuntimeEdits.set(promptId, key);
+    setTimeout(() => pendingRuntimeEdits.delete(promptId), 5 * 60_000).unref?.();
+  }
+}
+
+async function applyRuntimeEdit(chatId: number, key: RuntimeSettableKey, raw: string): Promise<void> {
+  const trimmed = raw.trim();
+  try {
+    if (key === "JUP_GATE_MIN_FEES") {
+      const n = Number(trimmed);
+      if (!Number.isFinite(n) || n < 0) {
+        await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: expected a non-negative number`, parse_mode: "HTML" });
+        return;
+      }
+      updateRuntimeSettings((draft) => { draft.jupGate.minFees = n; });
+    } else if (key === "JUP_GATE_SCORE_LABELS") {
+      // Parse comma-separated list; trim + lowercase + filter empty. Empty
+      // string -> empty array (= "any label allowed").
+      const labels = trimmed.length === 0
+        ? []
+        : trimmed.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0);
+      updateRuntimeSettings((draft) => { draft.jupGate.allowedScoreLabels = labels; });
+    } else if (key === "JUP_GATE_ORG_VOL" || key === "JUP_GATE_ORG_BUYERS") {
+      const n = Number(trimmed);
+      if (!Number.isFinite(n) || n < 0 || n > 100) {
+        await tgPost("sendMessage", { chat_id: chatId, text: `❌ Expected a number 0–100 (0 = disabled)`, parse_mode: "HTML" });
+        return;
+      }
+      updateRuntimeSettings((draft) => {
+        if (key === "JUP_GATE_ORG_VOL") draft.jupGate.minOrganicVolumePct = n;
+        else draft.jupGate.minOrganicBuyersPct = n;
+      });
+    } else {
+      // JUP_GATE_ENABLED — shouldn't be routed here (it's a toggle), but
+      // accept truthy/falsy text as a fallback.
+      const on = /^(1|true|on|yes|y)$/i.test(trimmed);
+      const off = /^(0|false|off|no|n)$/i.test(trimmed);
+      if (!on && !off) {
+        await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: expected on/off`, parse_mode: "HTML" });
+        return;
+      }
+      updateRuntimeSettings((draft) => { draft.jupGate.enabled = on; });
+    }
+  } catch (err) {
+    await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: ${escapeHtml((err as Error).message)}`, parse_mode: "HTML" });
+    return;
+  }
+
+  const current = formatRuntimeCurrent(key);
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: `✅ <b>${RUNTIME_EDIT_LABELS[key]}</b> → <b>${escapeHtml(current)}</b>\n<i>Saved to state/settings.json. Live now.</i>`,
+    parse_mode: "HTML",
+  });
+  logger.info({ key, value: current }, "[settings] runtime setting updated via telegram");
+}
+
 async function sendStartMenu(chatId: number): Promise<void> {
   const stats = getStats();
   const sol = await getWalletSolBalance().catch(() => null);
@@ -385,7 +699,7 @@ async function sendStartMenu(chatId: number): Promise<void> {
   const open = getPositions().filter((p) => p.status === "open" || p.status === "opening");
 
   const armed = open.filter((p) => p.armed).length;
-  const llmActive = CONFIG.LLM_EXIT_ENABLED && Boolean(CONFIG.MINIMAX_API_KEY);
+  const llmActive = CONFIG.LLM_EXIT_ENABLED && Boolean(CONFIG.LLM_API_KEY);
   const mode = stats.dryRun ? "🧪 DRY" : "🟢 LIVE";
   const pnlIcon = stats.realizedPnlSol >= 0 ? "🟢" : "🔴";
   const pnlSign = stats.realizedPnlSol >= 0 ? "+" : "";
@@ -426,9 +740,17 @@ async function sendPositions(chatId: number): Promise<void> {
     return;
   }
 
+  const mints = open.map((p) => p.mint);
+  const [infoMap, auditResults] = await Promise.all([
+    getTokenInfos(mints).catch(() => new Map<string, TokenInfo>()),
+    Promise.all(mints.map((m) => fetchJupAudit(m).catch(() => null))),
+  ]);
+  const auditMap = new Map(mints.map((m, i) => [m, auditResults[i] ?? null]));
+  const body = open.map((p) => formatPosition(p, infoMap.get(p.mint), auditMap.get(p.mint))).join("\n<code>──────────────────</code>\n");
+
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text: `📊 <b>Open Positions (${open.length})</b>\n\n${open.map(formatPosition).join("\n\n")}`,
+    text: `📊 <b>Open Positions (${open.length})</b>\n\n${body}`,
     parse_mode: "HTML",
     disable_web_page_preview: true,
     reply_markup: { inline_keyboard: sellButtons(open) },
@@ -564,6 +886,44 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     return;
   }
 
+  if (data === "sources:refresh" || data.startsWith("sources:mode:")) {
+    const message = await handleSources(chatId, data);
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: message });
+    return;
+  }
+
+  if (data.startsWith("backtest:run:")) {
+    const [, , rawSource, rawMode] = data.split(":");
+    const source = rawSource === "okx" || rawSource === "gmgn" ? rawSource : "gmgn";
+    if (rawMode === "filter") {
+      await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${source.toUpperCase()} filter sweep...` });
+      await handleFilterSweep(chatId, source);
+      return;
+    }
+    const mode = rawMode === "hybrid" ? "hybrid" : "all";
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${source.toUpperCase()} · ${mode}...` });
+    await handleBacktest(chatId, `${source} ${mode}`);
+    return;
+  }
+
+  if (data === "wss:refresh") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Refreshed" });
+    await handleWss(chatId);
+    return;
+  }
+
+  if (data === "wss:enable" || data === "wss:disable") {
+    const enabled = data === "wss:enable";
+    await setWssEnabled(enabled);
+    await tgPost("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      text: enabled ? "OKX WSS enabled" : "OKX WSS disabled",
+    });
+    await handleWss(chatId);
+    logger.info({ enabled }, "[okx-wss] toggled via telegram");
+    return;
+  }
+
   if (data.startsWith("adopt:")) {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
     await handleAdopt(chatId, data);
@@ -571,7 +931,14 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   }
 
   if (data.startsWith("edit:")) {
-    const key = data.slice(5) as SettableKey;
+    const rawKey = data.slice(5);
+    // Route runtime-settings edits (jupGate) separately from SETTABLE_SPECS.
+    if (rawKey === "JUP_GATE_MIN_FEES" || rawKey === "JUP_GATE_SCORE_LABELS" || rawKey === "JUP_GATE_ENABLED" || rawKey === "JUP_GATE_ORG_VOL" || rawKey === "JUP_GATE_ORG_BUYERS") {
+      await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+      await promptForRuntimeEdit(chatId, rawKey);
+      return;
+    }
+    const key = rawKey as SettableKey;
     if (key in SETTABLE_SPECS) {
       await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
       await promptForEdit(chatId, key);
@@ -582,7 +949,20 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   }
 
   if (data.startsWith("toggle:")) {
-    const key = data.slice(7) as SettableKey;
+    const rawKey = data.slice(7);
+    // Route jupGate toggle separately — it lives in runtime settings, not env.
+    if (rawKey === "JUP_GATE_ENABLED") {
+      updateRuntimeSettings((draft) => { draft.jupGate.enabled = !draft.jupGate.enabled; });
+      const after = getRuntimeSettings().jupGate.enabled;
+      await tgPost("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: `🔍 Jup gate: ${after ? "on" : "off"}`,
+      });
+      await sendAllSettingsMenu(chatId);
+      logger.info({ key: rawKey, value: after }, "[settings] runtime setting toggled via telegram");
+      return;
+    }
+    const key = rawKey as SettableKey;
     if (!(key in SETTABLE_SPECS) || SETTABLE_SPECS[key].type !== "boolean") {
       await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Unknown toggle" });
       return;
@@ -598,7 +978,10 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
       callback_query_id: cq.id,
       text: `${SETTINGS_LABELS[key]}: ${SETTABLE_SPECS[key].display(v)}`,
     });
-    await sendSettingsMenu(chatId);  // refresh menu so they see the new state
+    // Re-show the same Live Settings menu they tapped from, not the parent
+    // menu — otherwise tapping Toggle LLM advisor appears to drop them back
+    // to the top-level Settings screen.
+    await sendAllSettingsMenu(chatId);
     logger.info({ key, value: v }, "[settings] toggled via telegram");
     return;
   }
@@ -607,7 +990,7 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
 }
 
 // ---------------------------------------------------------------------------
-// /pause and /resume — stop / resume taking new SCG alerts.
+// /pause and /resume — stop / resume taking new source alerts.
 // Open positions keep running regardless.
 // ---------------------------------------------------------------------------
 async function handlePause(chatId: number): Promise<void> {
@@ -619,7 +1002,7 @@ async function handlePause(chatId: number): Promise<void> {
   logger.info("[telegram] bot paused via /pause");
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text: "⏸ <b>Paused</b> — new SCG alerts will be ignored.\nOpen positions keep running.\nUse /resume to resume.",
+    text: "⏸ <b>Paused</b> — new SCG/OKX/GMGN alerts will be ignored.\nOpen positions keep running.\nUse /resume to resume.",
     parse_mode: "HTML",
   });
 }
@@ -685,95 +1068,393 @@ function formatRecentPollerDecisions(): string[] {
   return lines;
 }
 
-async function handlePing(chatId: number): Promise<void> {
-  const lines: string[] = ["🩺 <b>Connectivity check</b>"];
+function looseRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
 
-  // Check 1 — upstream reachability. Fresh fetch, timed, with its own error
-  // surface. This isolates network/DNS/TLS/auth from the running poller.
-  const t0 = Date.now();
-  let upstreamOk = false;
-  let newestKey: string | null = null;
-  let newestName: string | null = null;
-  let newestAgeMins: number | null = null;
-  let upstreamAlertCount = 0;
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
-    const res = await fetch(SCG_URL, { signal: controller.signal });
-    clearTimeout(timeout);
-    const latency = Date.now() - t0;
-    if (!res.ok) {
-      lines.push(`1. Upstream API: ❌ HTTP ${res.status} ${escapeHtml(res.statusText)} (${latency}ms)`);
-    } else {
-      const body = (await res.json().catch(() => ({}))) as ScgAlertsResponse;
-      const alerts = Array.isArray(body?.alerts) ? body.alerts : [];
-      upstreamAlertCount = alerts.length;
-      // Newest = largest alert_time. Don't assume API order.
-      let newest: ScgAlertsResponse["alerts"][number] | null = null;
-      for (const a of alerts) {
-        if (!newest || a.alert_time > newest.alert_time) newest = a;
-      }
-      if (newest) {
-        newestKey = alertKey(newest);
-        newestName = newest.name;
-        newestAgeMins = newest.age_mins;
-      }
-      upstreamOk = true;
-      lines.push(`1. Upstream API: ✅ HTTP 200 · ${alerts.length} alerts · ${latency}ms`);
-    }
-  } catch (err) {
-    const msg = (err as Error)?.message ?? String(err);
-    lines.push(`1. Upstream API: ❌ ${escapeHtml(msg)}`);
+function readPath(root: unknown, pathParts: string[]): unknown {
+  let current: unknown = root;
+  for (const part of pathParts) {
+    const rec = looseRecord(current);
+    if (!rec || !(part in rec)) return undefined;
+    current = rec[part];
   }
+  return current;
+}
 
-  // Check 2 — poller is processing what it receives. Compare newest upstream
-  // alert against the poller's in-memory dedup set. If upstream has alert X
-  // and dedup doesn't contain X, the poller isn't processing even though the
-  // network is fine. Also surface pause state + last successful tick age.
+function firstNumber(root: unknown, paths: string[][]): number | null {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function firstString(root: unknown, paths: string[][]): string | null {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    if (typeof raw === "string" && raw.trim().length > 0) return raw.trim();
+    if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  }
+  return null;
+}
+
+function firstBoolean(root: unknown, paths: string[][]): boolean | null {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    if (typeof raw === "boolean") return raw;
+    if (typeof raw === "string") {
+      if (raw === "true") return true;
+      if (raw === "false") return false;
+    }
+  }
+  return null;
+}
+
+function firstObject(root: unknown, paths: string[][]): Record<string, unknown> | null {
+  for (const pathParts of paths) {
+    const rec = looseRecord(readPath(root, pathParts));
+    if (rec) return rec;
+  }
+  return null;
+}
+
+function firstNumberList(root: unknown, paths: string[][]): number[] {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    if (!Array.isArray(raw)) continue;
+    const values = raw
+      .map((value) => Number(value))
+      .filter(Number.isFinite);
+    if (values.length > 0) return values;
+  }
+  return [];
+}
+
+function formatLooseCount(value: number | null): string {
+  return value == null ? "—" : value.toLocaleString("en-US");
+}
+
+function formatOkxWalletTypes(types: number[]): string {
+  if (types.length === 0) return "any";
+  return types
+    .map((type) => {
+      if (type === 1) return "Smart";
+      if (type === 2) return "KOL";
+      if (type === 3) return "Whale";
+      return `type ${type}`;
+    })
+    .join("/");
+}
+
+function formatOkxLiveFilter(status: unknown): string {
+  const minHolders = firstNumber(status, [["liveFilter", "minHolders"], ["filter", "minHolders"]]);
+  const walletTypes = firstNumberList(status, [["liveFilter", "walletTypes"], ["filter", "walletTypes"]]);
+  const pieces = [
+    minHolders != null ? `holders ≥ ${minHolders.toLocaleString("en-US")}` : null,
+    `wallets ${formatOkxWalletTypes(walletTypes)}`,
+  ].filter(Boolean);
+  return pieces.length > 0 ? pieces.join(" · ") : "—";
+}
+
+function formatLooseCandidate(candidate: Record<string, unknown> | null): string {
+  if (!candidate) return "—";
+  const name = firstString(candidate, [["name"], ["symbol"], ["tokenSymbol"], ["token", "symbol"]]);
+  const mint = firstString(candidate, [["mint"], ["address"], ["tokenAddress"], ["token", "mint"], ["token", "address"]]);
+  const score = firstNumber(candidate, [["score"], ["organicScore"], ["confidence"]]);
+  const mcap = firstNumber(candidate, [["mcap"], ["marketCap"], ["marketCapUsd"], ["market_cap_usd"]]);
+  const liq = firstNumber(candidate, [["liquidity"], ["liquidityUsd"], ["liquidity_usd"]]);
+  const wallets = firstNumber(candidate, [["triggerWallets"], ["wallets"], ["walletCount"], ["stats", "triggerWallets"]]);
+  const pieces = [
+    name ? `<code>${escapeHtml(name)}</code>` : null,
+    mint ? `<code>${escapeHtml(mint.slice(0, 6))}…${escapeHtml(mint.slice(-4))}</code>` : null,
+    score != null ? `score ${score}` : null,
+    mcap != null ? `mcap ${fmtMcap(mcap)}` : null,
+    liq != null ? `liq ${fmtMcap(liq)}` : null,
+    wallets != null ? `${wallets} wallets` : null,
+  ].filter(Boolean);
+  return pieces.length > 0 ? pieces.join(" · ") : "candidate seen";
+}
+
+function okxStatusCounts(status: unknown): { seen: number | null; filtered: number | null; accepted: number | null } {
+  return {
+    seen: firstNumber(status, [["seen"], ["candidatesSeen"], ["seenCount"], ["counts", "seen"], ["stats", "seen"]]),
+    filtered: firstNumber(status, [["filtered"], ["rejected"], ["filteredCount"], ["counts", "filtered"], ["counts", "rejected"], ["stats", "filtered"]]),
+    accepted: firstNumber(status, [["accepted"], ["fired"], ["acceptedCount"], ["counts", "accepted"], ["counts", "fired"], ["stats", "accepted"]]),
+  };
+}
+
+function okxDiscoveryStatusLines(result: OkxSignalStatusResult): string[] {
+  if (!result.available) {
+    return [`• status: unavailable — <code>${escapeHtml(result.error ?? "unknown")}</code>`];
+  }
+  const status = result.status;
+  const enabled = firstBoolean(status, [["enabled"]]);
+  const running = firstBoolean(status, [["running"]]);
+  const configured = firstBoolean(status, [["configured"]]);
+  const lastRefreshAt = firstNumber(status, [["lastRefreshAt"], ["lastPollAt"], ["lastScanAt"], ["lastTickAt"], ["lastRunAt"]]);
+  const lastError = firstString(status, [["lastError"], ["error"]]);
+  const counts = okxStatusCounts(status);
+  const latest = firstObject(status, [["lastCandidate"], ["latestCandidate"], ["latest"], ["candidate"], ["latestSignal"]]);
+  const rejection = firstString(status, [
+    ["lastRejectionReason"],
+    ["lastRejectReason"],
+    ["lastFilteredReason"],
+    ["lastRejected", "reason"],
+    ["lastRejection", "reason"],
+  ]);
+  const watched = firstNumber(status, [["watchedMints"], ["watchlist", "size"], ["watchlistSize"]]);
+  const minHolders = firstNumber(status, [["baseline", "minHolders"]]);
+  const minLiquidity = firstNumber(status, [["baseline", "minLiquidityUsd"]]);
+  const maxTop10 = firstNumber(status, [["baseline", "maxTop10HolderRate"], ["baseline", "maxTop10Pct"]]);
+  const minScans = firstNumber(status, [["trigger", "minScans"]]);
+  const holderGrowth = firstNumber(status, [["trigger", "minHolderGrowthPct"]]);
+  const state = enabled === false
+    ? "disabled"
+    : configured === false
+      ? "missing OKX creds"
+      : `okx_discovery${running === false ? " idle" : " running"}`;
+  const jupCfg = getRuntimeSettings().jupGate;
+  const lines = [
+    `• status: ${escapeHtml(state)}${lastRefreshAt ? ` · last scan ${formatAgo(Date.now() - lastRefreshAt)}` : ""}`,
+    `• baseline: holders ≥ ${formatLooseCount(minHolders)} · liq ≥ ${minLiquidity == null ? "—" : fmtMcap(minLiquidity)}${maxTop10 != null ? ` · top10 ≤ ${maxTop10 > 1 ? maxTop10.toFixed(0) : (maxTop10 * 100).toFixed(0)}%` : ""}`,
+    `• tracking: ${formatLooseCount(watched)} watched · ${formatLooseCount(minScans)} scans · holder growth ≥ ${holderGrowth == null ? "—" : `${holderGrowth}%`}`,
+    `• Jup gate: ${escapeHtml(formatJupGate(jupCfg))}`,
+    `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
+    `• latest candidate: ${formatLooseCandidate(latest)}`,
+    `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,
+  ];
+  if (lastError) {
+    lines.push(`• last error: <code>${escapeHtml(lastError)}</code>`);
+  }
+  return lines;
+}
+
+function gmgnDiscoveryStatusLines(result: GmgnSignalStatusResult): string[] {
+  if (!result.available) {
+    return [`• status: unavailable — <code>${escapeHtml(result.error ?? "unknown")}</code>`];
+  }
+  const status = result.status;
+  const enabled = firstBoolean(status, [["enabled"]]);
+  const running = firstBoolean(status, [["running"]]);
+  const mode = firstString(status, [["sourceMode"], ["mode"]]);
+  const lastScanAt = firstNumber(status, [["lastScanAt"], ["lastPollAt"], ["lastRefreshAt"], ["lastRunAt"]]);
+  const lastError = firstString(status, [["lastError"], ["error"]]);
+  const counts = okxStatusCounts(status);
+  const watched = firstNumber(status, [["watchedMints"], ["watchlistSize"], ["watchlist", "size"]]);
+  const latest = firstObject(status, [["lastCandidate"], ["latestCandidate"], ["latest"]]);
+  const rejection = firstString(status, [["lastRejectionReason"], ["lastRejectReason"]]);
+  const minHolders = firstNumber(status, [["baseline", "minHolders"]]);
+  const minLiquidity = firstNumber(status, [["baseline", "minLiquidityUsd"]]);
+  const maxTop10 = firstNumber(status, [["baseline", "maxTop10HolderRate"], ["baseline", "maxTop10Pct"]]);
+  const minScans = firstNumber(status, [["trigger", "minScans"]]);
+  const holderGrowth = firstNumber(status, [["trigger", "minHolderGrowthPct"]]);
+  const configured = firstBoolean(status, [["configured"]]);
+  const state = enabled === false
+    ? "disabled"
+    : configured === false
+      ? "missing GMGN_API_KEY"
+      : `${mode ?? "gmgn"}${running === false ? " idle" : " running"}`;
+  const jupCfg = getRuntimeSettings().jupGate;
+  const lines = [
+    `• status: ${escapeHtml(state)}${lastScanAt ? ` · last scan ${formatAgo(Date.now() - lastScanAt)}` : ""}`,
+    `• baseline: holders ≥ ${formatLooseCount(minHolders)} · liq ≥ ${minLiquidity == null ? "—" : fmtMcap(minLiquidity)}${maxTop10 != null ? ` · top10 ≤ ${maxTop10 > 1 ? maxTop10.toFixed(0) : (maxTop10 * 100).toFixed(0)}%` : ""}`,
+    `• tracking: ${formatLooseCount(watched)} watched · ${formatLooseCount(minScans)} scans · holder growth ≥ ${holderGrowth == null ? "—" : `${holderGrowth}%`}`,
+    `• Jup gate: ${escapeHtml(formatJupGate(jupCfg))}`,
+    `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
+    `• latest candidate: ${formatLooseCandidate(latest)}`,
+    `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,
+  ];
+  if (lastError) {
+    lines.push(`• last error: <code>${escapeHtml(lastError)}</code>`);
+  }
+  return lines;
+}
+
+function sourceModeKeyboard(current: SourceMode): Array<Array<{ text: string; callback_data: string }>> {
+  const button = (mode: SourceMode): { text: string; callback_data: string } => ({
+    text: `${current === mode ? "✅ " : ""}${SOURCE_MODE_LABELS[mode]}`,
+    callback_data: `sources:mode:${mode}`,
+  });
+  return [
+    // [SCG-DISABLED 2026-04-22] scg_only button hidden; re-enable alongside SOURCE_MODES.
+    // [button("scg_only"), button("okx_watch")],
+    [button("okx_watch"), button("hybrid")],
+    [button("okx_only"), button("gmgn_watch")],
+    [button("gmgn_live"), button("gmgn_only")],
+    [{ text: "🔄 Refresh", callback_data: "sources:refresh" }],
+  ];
+}
+
+async function sendSourcesMenu(chatId: number): Promise<void> {
+  const settings = getRuntimeSettings();
+  const sourceMode = settings.signals.sourceMode;
   const health = getPollerHealth();
   const now = Date.now();
-  const lastOkAgo = health.lastTickOkAt ? now - health.lastTickOkAt : Infinity;
+  const recent = getRecentAlertEvents();
+  const fired = recent.filter((e) => e.action === "fired").length;
+  const filtered = recent.filter((e) => e.action === "filtered").length;
+  const latest = recent[recent.length - 1];
+  const lastRejected = [...recent].reverse().find((e) => e.action === "filtered" && e.reason);
+  // [SCG-DISABLED 2026-04-22] scgState/health/recent/filtered/fired/latest/lastRejected
+  // are still computed but not rendered in the sources menu while SCG is off.
+  // Uncomment the "SCG Alpha" lines block below to restore.
+  void isPaused; void health; void recent; void fired; void filtered; void latest; void lastRejected; void now;
+  // const scgState = isPaused()
+  //   ? "paused"
+  //   : health.lastTickError
+  //     ? "error"
+  //     : health.lastTickOkAt
+  //       ? "polling"
+  //       : "starting";
+  const okxStatus = await getSafeOkxSignalStatus();
+  const gmgnStatus = await getSafeGmgnSignalStatus();
+
+  const lines = [
+    "🧭 <b>Signal sources</b>",
+    "",
+    `Active mode: <b>${SOURCE_MODE_LABELS[sourceMode]}</b> <code>${sourceMode}</code>`,
+    "",
+    // [SCG-DISABLED 2026-04-22] SCG Alpha section hidden. Restore when re-enabling SCG.
+    // "<b>SCG Alpha</b>",
+    // `• status: ${scgState} · last poll ${health.lastTickOkAt ? formatAgo(now - health.lastTickOkAt) : "never"} · HTTP ${health.lastHttpStatus ?? "—"}`,
+    // `• counts: seen ${health.seenSize.toLocaleString("en-US")} · filtered ${filtered.toLocaleString("en-US")} · accepted ${fired.toLocaleString("en-US")} (recent ${recent.length})`,
+    // `• latest candidate: ${latest ? `<code>${escapeHtml(latest.name)}</code> · ${latest.action}${latest.reason ? ` · ${escapeHtml(latest.reason)}` : ""}` : "—"}`,
+    // `• last rejection: ${lastRejected?.reason ? `<code>${escapeHtml(lastRejected.reason)}</code>` : "—"}`,
+    // "",
+    "<b>OKX discovery</b>",
+    ...okxDiscoveryStatusLines(okxStatus),
+    "",
+    "<b>GMGN scanner</b>",
+    ...gmgnDiscoveryStatusLines(gmgnStatus),
+    "",
+    "<i>Mode changes save to state/settings.json and ask source scanners to refresh.</i>",
+  ];
+
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: sourceModeKeyboard(sourceMode) },
+  });
+}
+
+async function handleSources(chatId: number, data?: string): Promise<string> {
+  if (data?.startsWith("sources:mode:")) {
+    const rawMode = data.slice("sources:mode:".length);
+    if (!isSourceMode(rawMode)) return "Unknown source mode";
+    updateRuntimeSettings((draft) => {
+      draft.signals.sourceMode = rawMode;
+      draft.signals.okx.discovery.enabled = rawMode === "okx_watch" || rawMode === "hybrid" || rawMode === "okx_only";
+      draft.signals.gmgn.enabled = rawMode === "gmgn_watch" || rawMode === "gmgn_live" || rawMode === "gmgn_only" || rawMode === "hybrid";
+    });
+    await refreshSafeOkxSignalSource();
+    await refreshSafeGmgnSignalSource();
+    await sendSourcesMenu(chatId);
+    logger.info({ sourceMode: rawMode }, "[settings] source mode updated via telegram");
+    return `${SOURCE_MODE_LABELS[rawMode]} selected`;
+  }
+
+  if (data === "sources:refresh") {
+    await refreshSafeOkxSignalSource();
+    await refreshSafeGmgnSignalSource();
+    await sendSourcesMenu(chatId);
+    return "Refreshed";
+  }
+
+  await sendSourcesMenu(chatId);
+  return "Sources";
+}
+
+async function handlePing(chatId: number): Promise<void> {
+  const lines: string[] = ["🩺 <b>Connectivity check</b>"];
+  const sourceMode = getRuntimeSettings().signals.sourceMode;
   const paused = isPaused();
-  const pollerRecentlyOk = Number.isFinite(lastOkAgo) && lastOkAgo <= Math.max(CONFIG.SCG_POLL_MS * 2, 5_000);
+  let checkNum = 0;
 
-  if (!upstreamOk) {
-    lines.push("2. Poller processing: ⚠️ skipped (upstream unreachable)");
-  } else if (upstreamAlertCount === 0) {
-    lines.push("2. Poller processing: ⚠️ upstream returned 0 alerts — nothing to verify");
-  } else if (newestKey && hasSeenAlert(newestKey)) {
-    lines.push(
-      `2. Poller processing: ✅ newest upstream alert is in dedup set` +
-        (newestName ? ` (<code>${escapeHtml(newestName)}</code>, age ${newestAgeMins}m)` : ""),
-    );
-  } else if (pollerRecentlyOk && !health.lastTickError) {
-    lines.push(
-      `2. Poller processing: ⚠️ newest upstream alert is not seen yet — poller is alive and may be one tick behind` +
-        (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
-    );
+  // Check 1 — GMGN reachability + API key validity.
+  if (process.env.GMGN_API_KEY?.trim()) {
+    checkNum++;
+    const t0 = Date.now();
+    try {
+      const { randomUUID } = await import("node:crypto");
+      const url = new URL("/v1/market/rank", process.env.GMGN_HOST?.trim() || "https://openapi.gmgn.ai");
+      url.searchParams.set("chain", "sol");
+      url.searchParams.set("interval", "5m");
+      url.searchParams.set("limit", "1");
+      url.searchParams.set("timestamp", String(Math.floor(Date.now() / 1000)));
+      url.searchParams.set("client_id", randomUUID());
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8_000);
+      const res = await fetch(url, {
+        headers: { accept: "application/json", "X-APIKEY": process.env.GMGN_API_KEY.trim() },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      const latency = Date.now() - t0;
+      if (res.ok) {
+        lines.push(`${checkNum}. GMGN OpenAPI: ✅ HTTP 200 · ${latency}ms`);
+      } else {
+        const body = await res.text().catch(() => "");
+        const tag = (() => { try { const j = JSON.parse(body) as { error?: string }; return j.error ?? ""; } catch { return ""; } })();
+        lines.push(`${checkNum}. GMGN OpenAPI: ❌ HTTP ${res.status}${tag ? ` (${escapeHtml(tag)})` : ""} · ${latency}ms`);
+      }
+    } catch (err) {
+      lines.push(`${checkNum}. GMGN OpenAPI: ❌ ${escapeHtml((err as Error).message)}`);
+    }
   } else {
-    lines.push(
-      `2. Poller processing: ❌ newest upstream alert NOT in dedup set — poller is behind or stalled` +
-        (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
-    );
+    checkNum++;
+    lines.push(`${checkNum}. GMGN OpenAPI: ⚪ skipped (GMGN_API_KEY not set)`);
   }
 
-  // Check 3 — Telegram delivery. The reply itself is the proof; say so.
-  lines.push("3. Telegram delivery: ✅ (you're reading this message)");
+  // Check 2 — OKX signal source is actively running (means onchainos CLI + creds work).
+  checkNum++;
+  const okxDiscovery = await getSafeOkxSignalStatus();
+  const okxRunning = okxDiscovery.available && firstBoolean(okxDiscovery.status, [["running"]]) === true;
+  const okxSession = okxDiscovery.available ? firstString(okxDiscovery.status, [["sessionId"]]) : null;
+  if (okxRunning) {
+    lines.push(`${checkNum}. OKX signal stream (discovery): ✅ WSS session active${okxSession ? ` (${escapeHtml(okxSession.slice(0, 12))}…)` : ""}`);
+  } else if (okxDiscovery.available) {
+    const err = firstString(okxDiscovery.status, [["lastError"]]);
+    lines.push(`${checkNum}. OKX signal stream (discovery): ⚠️ session not running${err ? ` — <code>${escapeHtml(err)}</code>` : ""}`);
+  } else {
+    lines.push(`${checkNum}. OKX signal stream (discovery): ❌ ${escapeHtml(okxDiscovery.error ?? "unavailable")}`);
+  }
 
-  // Runtime state useful for diagnosing
+  // Check 3 — Telegram delivery. The reply itself is the proof.
+  checkNum++;
+  lines.push(`${checkNum}. Telegram delivery: ✅ (you're reading this message)`);
+
+  // Runtime state
   lines.push("");
-  lines.push("<b>Poller state</b>");
-  lines.push(`• last successful poll: ${formatAgo(lastOkAgo)}`);
-  lines.push(`• last HTTP status: ${health.lastHttpStatus ?? "—"}`);
-  if (health.lastTickError) {
-    lines.push(`• last error: <code>${escapeHtml(health.lastTickError)}</code>`);
-  }
-  lines.push(`• dedup set size: ${health.seenSize}`);
+  lines.push("<b>Bot state</b>");
   lines.push(`• paused: ${paused ? "🟡 yes — run /resume" : "no"}`);
   lines.push(`• blacklisted mints: ${getBlacklist().length}`);
-  lines.push(...formatRecentPollerDecisions());
+
+  const gmgnDiscovery = await getSafeGmgnSignalStatus();
+  lines.push("");
+  lines.push("<b>Signal sources</b>");
+  lines.push(`• active mode: <b>${SOURCE_MODE_LABELS[sourceMode]}</b> <code>${sourceMode}</code>`);
+  lines.push(...okxDiscoveryStatusLines(okxDiscovery).map((line) => `• OKX discovery ${line.slice(2)}`));
+  lines.push(...gmgnDiscoveryStatusLines(gmgnDiscovery).map((line) => `• GMGN scanner ${line.slice(2)}`));
+  const wss = getOkxWsStatus();
+  const wssLastEventAgo = wss.lastEventAt ? formatAgo(Date.now() - wss.lastEventAt) : "never";
+  const wssLastPollAgo = wss.lastPollAt ? formatAgo(Date.now() - wss.lastPollAt) : "never";
+  lines.push("");
+  lines.push("<b>OKX price-feed WSS (open positions)</b>");
   lines.push(
-    `• runtime: node ${process.version} · ${process.platform}/${process.arch} · poll every ${CONFIG.SCG_POLL_MS}ms`,
+    `• status: ${wss.enabled ? "enabled" : "disabled"} · ${wss.activeSessions}/${wss.watchedMints} sessions · last event ${wssLastEventAgo} · last poll ${wssLastPollAgo}`,
+  );
+  if (wss.disabledReason && !wss.enabled) {
+    lines.push(`• reason: <code>${escapeHtml(wss.disabledReason)}</code>`);
+  }
+  if (wss.lastError) {
+    lines.push(`• last error: <code>${escapeHtml(wss.lastError)}</code>`);
+  }
+  lines.push(
+    `• runtime: node ${process.version} · ${process.platform}/${process.arch}`,
   );
 
   await tgPost("sendMessage", {
@@ -781,6 +1462,49 @@ async function handlePing(chatId: number): Promise<void> {
     text: lines.join("\n"),
     parse_mode: "HTML",
     disable_web_page_preview: true,
+  });
+}
+
+async function handleWss(chatId: number): Promise<void> {
+  const status = getOkxWsStatus();
+  const settings = getRuntimeSettings().marketData.wss;
+  const now = Date.now();
+  const lastEvent = status.lastEventAt ? formatAgo(now - status.lastEventAt) : "never";
+  const lastPoll = status.lastPollAt ? formatAgo(now - status.lastPollAt) : "never";
+  const openCount = getPositions().filter((p) => p.status === "open").length;
+  const lines = [
+    "📡 <b>OKX open-position WSS</b>",
+    "",
+    `Status: <b>${status.enabled ? "enabled" : "disabled"}</b>`,
+    `Sessions: <b>${status.activeSessions}/${status.watchedMints}</b> active · ${openCount} open positions`,
+    `Channels: <code>${escapeHtml(settings.channels.join(", "))}</code>`,
+    `Poll: ${settings.pollMs}ms · wake throttle: ${settings.triggerTickMs}ms`,
+    `Last event: ${lastEvent}`,
+    `Last poll: ${lastPoll}`,
+  ];
+  if (status.disabledReason && !status.enabled) {
+    lines.push(`Reason: <code>${escapeHtml(status.disabledReason)}</code>`);
+  }
+  if (status.lastError) {
+    lines.push(`Last error: <code>${escapeHtml(status.lastError)}</code>`);
+  }
+  lines.push("");
+  lines.push("<i>WSS never buys or sells directly. It only wakes the normal Jupiter-confirmed exit checks.</i>");
+
+  const toggle = status.enabled
+    ? { text: "⏸ Disable WSS", callback_data: "wss:disable" }
+    : { text: "▶️ Enable WSS", callback_data: "wss:enable" };
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [toggle],
+        [{ text: "🔄 Refresh", callback_data: "wss:refresh" }],
+      ],
+    },
   });
 }
 
@@ -884,6 +1608,13 @@ async function handleStats(chatId: number): Promise<void> {
     .map(([k, v]) => `${k}: ${v >= 0 ? "+" : ""}${v.toFixed(2)}`)
     .join(" | ");
 
+  const sourceLines = stats.bySource
+    .map((s) => {
+      const pnl = s.avgPnlPct >= 0 ? `+${s.avgPnlPct.toFixed(1)}%` : `${s.avgPnlPct.toFixed(1)}%`;
+      return `  ${escapeHtml(s.source)}: ${(s.winRate * 100).toFixed(0)}% win | avg ${pnl} | ${s.count}`;
+    })
+    .join("\n");
+
   const lines: string[] = [
     `📊 <b>Signal Stats</b> — ${stats.totalTrades} trades with metadata`,
     "",
@@ -894,6 +1625,8 @@ async function handleStats(chatId: number): Promise<void> {
     `<b>Win Rate by MCap Tier</b>`,
     tierLines,
     "",
+    sourceLines ? `<b>Win Rate by Source</b>\n${sourceLines}` : "",
+    sourceLines ? "" : "",
     corrTop ? `<b>Correlations w/ PnL</b>\n  ${corrTop}` : "",
     "",
     `<b>Active filter:</b> ${filterStr}`,
@@ -974,7 +1707,9 @@ async function handleHistory(chatId: number, argText: string): Promise<void> {
     const sign = t.pnlSol >= 0 ? "+" : "";
     const icon = t.pnlSol >= 0 ? "🟢" : "🔴";
     const hold = t.holdSecs >= 3600 ? `${Math.floor(t.holdSecs/3600)}h` : t.holdSecs >= 60 ? `${Math.floor(t.holdSecs/60)}m` : `${t.holdSecs}s`;
-    return `${icon} <b>${escapeHtml(t.name)}</b>  ${sign}${t.pnlSol.toFixed(4)} SOL (${sign}${t.pnlPct.toFixed(0)}%)  ${escapeHtml(t.reason)} · ${hold}`;
+    const source = t.signalMeta?.source;
+    const sourceTag = source ? ` · ${escapeHtml(source)}` : "";
+    return `${icon} <b>${escapeHtml(t.name)}</b>  ${sign}${t.pnlSol.toFixed(4)} SOL (${sign}${t.pnlPct.toFixed(0)}%)  ${escapeHtml(t.reason)} · ${hold}${sourceTag}`;
   });
   await tgPost("sendMessage", {
     chat_id: chatId,
@@ -993,12 +1728,12 @@ async function handleLlm(chatId: number): Promise<void> {
     return;
   }
   const now = CONFIG.LLM_EXIT_ENABLED;
-  const keySet = Boolean(CONFIG.MINIMAX_API_KEY);
+  const keySet = Boolean(CONFIG.LLM_API_KEY);
   await tgPost("sendMessage", {
     chat_id: chatId,
     text:
       `🧠 LLM advisor: <b>${now ? "🤖 ON" : "⚪️ OFF"}</b>` +
-      (now && !keySet ? `\n⚠️ MINIMAX_API_KEY is empty — LLM will skip every position.` : ""),
+      (now && !keySet ? `\n⚠️ LLM_API_KEY is empty — LLM will skip every position.` : ""),
     parse_mode: "HTML",
   });
   logger.info({ llm: now }, "[telegram] LLM toggled via /llm");
@@ -1057,7 +1792,7 @@ async function handleMcapFilter(chatId: number, argText: string): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
-// /skip <mint> — blacklist a token so SCG alerts for it are ignored.
+// /skip <mint> — blacklist a token so source alerts for it are ignored.
 // ---------------------------------------------------------------------------
 async function handleSkip(chatId: number, argText: string): Promise<void> {
   const mint = argText.trim();
@@ -1087,7 +1822,7 @@ async function handleSkip(chatId: number, argText: string): Promise<void> {
   logger.info({ mint }, "[telegram] added to blacklist");
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text: `🚫 Added to blacklist: <code>${escapeHtml(mint)}</code>\nSCG alerts for this token will be ignored.`,
+    text: `🚫 Added to blacklist: <code>${escapeHtml(mint)}</code>\nSCG/OKX/GMGN alerts for this token will be ignored.`,
     parse_mode: "HTML",
   });
 }
@@ -1161,6 +1896,7 @@ function formatSetupStatusHtml(report: DoctorReport): string {
     "env:HELIUS_API_KEY",
     "env:PRIV_B58",
     "env:okx",
+    "env:gmgn",
     "env:telegram",
     "onchainos:version",
     "onchainos:hot-tokens",
@@ -1208,9 +1944,73 @@ async function handleSetupStatus(chatId: number): Promise<void> {
 let backtestInFlight = false;
 
 async function handleBacktest(chatId: number, argText: string = ""): Promise<void> {
-  // `/backtest` compares all deterministic exit modes against SCG alerts.
-  // `/backtest hybrid` preserves the moonbag-heavy trail grid.
-  const mode: "all" | "hybrid" = argText.trim().toLowerCase() === "hybrid" ? "hybrid" : "all";
+  // `/backtest [source] [hybrid]` — source ∈ {scg, gmgn}, strategy ∈ {all, hybrid}
+  // [SCG-DISABLED 2026-04-22] Default source flipped from "scg" to "gmgn" now
+  // that live SCG polling is off. You can still pass `scg` explicitly to backtest
+  // against the SCG upstream (fetchScgTokens is still defined in _backtest.ts),
+  // but the default CLI path no longer hits SCG.
+  //   /backtest                  → interactive menu (buttons)
+  //   /backtest hybrid           → gmgn + hybrid
+  //   /backtest gmgn             → gmgn + all
+  //   /backtest gmgn hybrid      → gmgn + hybrid
+  //   /backtest_hybrid           → gmgn + hybrid (alias of `/backtest hybrid`)
+  const trimmed = argText.trim();
+
+  // Bare `/backtest` — show button menu so users discover variants without docs.
+  if (trimmed === "") {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        "🧪 <b>Choose backtest configuration</b>\n\n" +
+        "Two phases — <b>entry filter tuning</b> and <b>exit strategy tuning</b>. " +
+        "Each has an Adopt button that writes straight to <code>state/settings.json</code>, live, no restart.\n\n" +
+        "<b>1) 🔬 Filter sweep — ENTRY thresholds</b>\n" +
+        "Harvests the source's live universe, fetches forward OHLCV, and sweeps every baseline knob " +
+        "(holders, liquidity, mcap, top10, bundler, dev, etc.) to find the thresholds that best separate " +
+        "winners (max PnL ≥ +50%) from losers. Adopt → writes to <code>signals.{source}.baseline</code>. " +
+        "Run this FIRST to pick who the bot buys.\n" +
+        "  • <b>🔬 GMGN filter sweep</b> — sweeps GMGN trending entry gates\n" +
+        "  • <b>🔬 OKX filter sweep</b> — sweeps OKX hot-tokens entry gates\n\n" +
+        "<b>2) 🟢🔵 all / hybrid — EXIT parameters</b>\n" +
+        "Assumes the bot entered every candidate and grid-searches exit strategies. Top 5 rows come back " +
+        "with per-row Adopt buttons that write to <code>exit.trail</code> / <code>exit.risk</code> / " +
+        "<code>exit.profitStrategy</code>. Run this AFTER filter sweep to tune when the bot sells.\n" +
+        "  • <b>all</b> — compares every strategy: trail, fixed-TP, TP-ladder, and a small moonbag grid\n" +
+        "  • <b>hybrid</b> — focused grid on the hybrid strategy only (trail + scale-out + moonbag) — faster\n\n" +
+        "<b>Source choices</b>\n" +
+        "  • <b>GMGN</b> — GMGN trending/trenches universe (what the GMGN source polls live)\n" +
+        "  • <b>OKX</b> — OKX hot-tokens universe (what the OKX discovery source polls live)\n\n" +
+        "<b>Recommended flow:</b> 🔬 filter sweep → Adopt → 🟢🔵 exit grid → Adopt → watch /stats for a few days → re-tune.",
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🟢 GMGN · all", callback_data: "backtest:run:gmgn:all" },
+            { text: "🟢 GMGN · hybrid", callback_data: "backtest:run:gmgn:hybrid" },
+          ],
+          [
+            { text: "🔵 OKX · all", callback_data: "backtest:run:okx:all" },
+            { text: "🔵 OKX · hybrid", callback_data: "backtest:run:okx:hybrid" },
+          ],
+          [
+            { text: "🔬 GMGN filter sweep", callback_data: "backtest:run:gmgn:filter" },
+            { text: "🔬 OKX filter sweep", callback_data: "backtest:run:okx:filter" },
+          ],
+        ],
+      },
+    });
+    return;
+  }
+
+  const tokens = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
+  let source: "gmgn" | "okx" = "gmgn";
+  let mode: "all" | "hybrid" = "all";
+  for (const tok of tokens) {
+    if (tok === "gmgn") source = "gmgn";
+    else if (tok === "okx") source = "okx";
+    else if (tok === "hybrid") mode = "hybrid";
+    else if (tok === "all") mode = "all";
+  }
 
   if (backtestInFlight) {
     await tgPost("sendMessage", {
@@ -1225,11 +2025,16 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const llmWarning = CONFIG.LLM_EXIT_ENABLED
     ? "\n⚠️ <b>LLM exit advisor is ON.</b> LLM decisions are not candle-backtestable; this compares deterministic exits only."
     : "";
+  const sourceLabel = source === "gmgn" ? "GMGN" : "OKX";
+  const fetchBlurb =
+    source === "gmgn"
+      ? "Fetching GMGN signals/trenches + OHLCV. Signal calls with timestamps use after-call candles; others use first-candle entry."
+      : "Fetching OKX signal-stream history via onchainos + OHLCV from each signal's timestamp with at least ~24h runway.";
   const startMsg = await tgPost("sendMessage", {
     chat_id: chatId,
     text:
-      `🧪 <b>Running ${mode === "hybrid" ? "hybrid" : "exit strategy"} backtest...</b>\n` +
-      `<i>Fetching SCG alerts + OHLCV from signal time with at least ~24h runway when available.\n` +
+      `🧪 <b>Running ${mode === "hybrid" ? "hybrid" : "exit strategy"} backtest (${sourceLabel})...</b>\n` +
+      `<i>${fetchBlurb}\n` +
       `This takes ~60 seconds.</i>` +
       llmWarning,
     parse_mode: "HTML",
@@ -1237,13 +2042,13 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const statusId = startMsg?.result?.message_id;
 
   try {
-    const { topResults, allResults, samplesUsed, tokensFetched, durationMs, source, resolutionCounts, entrySourceCounts } = await runBacktest({
+    const { topResults, allResults, samplesUsed, tokensFetched, durationMs, resolutionCounts, entrySourceCounts } = await runBacktest({
       bar: "5m",
       topN: 5,
       minCandles: 60,
       hybrid: mode === "hybrid",
       allStrategies: mode === "all",
-      source: "scg",
+      source,
     });
 
     if (!topResults.length) {
@@ -1396,6 +2201,721 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
 }
 
 // ---------------------------------------------------------------------------
+// Filter-sweep handler (Telegram wrapper around runOkxFilterAnalysis /
+// runGmgnFilterAnalysis). Streams progress by editing a status message,
+// then formats the threshold sweep as <pre> tables split across messages.
+// ---------------------------------------------------------------------------
+let filterSweepInFlight = false;
+
+// Adopt-baseline state: registerFilterAdopt stashes the suggested baseline
+// under a short key; the "adopt:filter:<key>" callback reads it and applies
+// it via updateRuntimeSettings. Keys expire after 1h to avoid leaking.
+// `baseline` holds the source-specific baseline numeric fields (flat
+// key → number, e.g. minHolders). `jupGate` carries cross-source jup-gate
+// suggestions to write into draft.jupGate.* alongside baseline.
+type JupGateAdoptPayload = { minFees?: number; allowedScoreLabels?: string[]; minOrganicVolumePct?: number; minOrganicBuyersPct?: number };
+type PendingFilterAdopt = {
+  source: "okx" | "gmgn";
+  baseline: Record<string, number>;
+  jupGate: JupGateAdoptPayload;
+  at: number;
+};
+const pendingFilterAdopts = new Map<string, PendingFilterAdopt>();
+const FILTER_ADOPT_TTL_MS = 60 * 60 * 1000;
+
+function registerFilterAdopt(
+  source: "okx" | "gmgn",
+  baseline: Record<string, number>,
+  jupGate: JupGateAdoptPayload,
+): string {
+  // Prune expired entries cheaply on every registration.
+  const now = Date.now();
+  for (const [k, v] of pendingFilterAdopts) {
+    if (now - v.at > FILTER_ADOPT_TTL_MS) pendingFilterAdopts.delete(k);
+  }
+  const key = Math.random().toString(36).slice(2, 10);
+  pendingFilterAdopts.set(key, { source, baseline, jupGate, at: now });
+  return key;
+}
+
+// ---------------------------------------------------------------------------
+// Share / Import — compact base64 payload for exchanging filter+exit settings
+// ---------------------------------------------------------------------------
+type SharePayload = {
+  v: 1;
+  jupGate: { minFees: number; allowedScoreLabels: string[]; minOrganicVolumePct: number; minOrganicBuyersPct: number };
+  buy: { sizeSol: number };
+  exit: {
+    profitStrategyType: string;
+    fixedTargetPct: number;
+    ladderTargets: Array<{ pnlPct: number; sellPct: number }>;
+    trailRemainder: boolean;
+    armPct: number;
+    trailPct: number;
+    stopPct: number;
+    maxHoldSecs: number;
+    runnerKeepPct: number;
+    runnerTrailPct: number;
+    runnerTimeoutSecs: number;
+  };
+  milestones: { enabled: boolean; pcts: number[] };
+  okxBaseline: Record<string, number | boolean>;
+  okxTrigger: Record<string, number>;
+  gmgnBaseline: Record<string, number | boolean>;
+  gmgnTrigger: Record<string, number>;
+};
+
+const SHARE_ADOPT_TTL_MS = 60 * 60 * 1000;
+const pendingSharedAdopts = new Map<string, SharePayload>();
+
+function registerSharedAdopt(payload: SharePayload): string {
+  const now = Date.now();
+  // Prune expired entries.
+  for (const [k, v] of pendingSharedAdopts) {
+    if (now - (v as unknown as { _at: number })._at > SHARE_ADOPT_TTL_MS) pendingSharedAdopts.delete(k);
+  }
+  const key = Math.random().toString(36).slice(2, 10);
+  // Attach expiry timestamp out-of-band.
+  (payload as unknown as { _at: number })._at = now;
+  pendingSharedAdopts.set(key, payload);
+  return key;
+}
+
+function buildSharePayload(): SharePayload {
+  const s = getRuntimeSettings();
+  return {
+    v: 1,
+    jupGate: {
+      minFees: s.jupGate.minFees,
+      allowedScoreLabels: s.jupGate.allowedScoreLabels,
+      minOrganicVolumePct: s.jupGate.minOrganicVolumePct,
+      minOrganicBuyersPct: s.jupGate.minOrganicBuyersPct,
+    },
+    buy: { sizeSol: s.buy.sizeSol },
+    exit: {
+      profitStrategyType: s.exit.profitStrategy.type,
+      fixedTargetPct: s.exit.profitStrategy.fixedTargetPct,
+      ladderTargets: s.exit.profitStrategy.ladderTargets,
+      trailRemainder: s.exit.profitStrategy.trailRemainder,
+      armPct: s.exit.trail.armPct,
+      trailPct: s.exit.trail.trailPct,
+      stopPct: s.exit.risk.stopPct,
+      maxHoldSecs: s.exit.risk.maxHoldSecs,
+      runnerKeepPct: s.exit.runner.keepPct,
+      runnerTrailPct: s.exit.runner.trailPct,
+      runnerTimeoutSecs: s.exit.runner.timeoutSecs,
+    },
+    milestones: { enabled: s.milestones.enabled, pcts: s.milestones.pcts },
+    okxBaseline: s.signals.okx.discovery.baseline as unknown as Record<string, number | boolean>,
+    okxTrigger: s.signals.okx.discovery.trigger as unknown as Record<string, number>,
+    gmgnBaseline: s.signals.gmgn.baseline as unknown as Record<string, number | boolean>,
+    gmgnTrigger: s.signals.gmgn.trigger as unknown as Record<string, number>,
+  };
+}
+
+function formatShareSummary(p: SharePayload): string {
+  const labelsText = p.jupGate.allowedScoreLabels.length > 0
+    ? p.jupGate.allowedScoreLabels.join(", ")
+    : "any";
+  const ladderText = p.exit.ladderTargets.length > 0
+    ? p.exit.ladderTargets.map(t => `${(t.pnlPct * 100).toFixed(0)}%:${(t.sellPct * 100).toFixed(0)}%`).join(", ")
+    : "—";
+  return (
+    `<b>JupGate</b>  minFees=${p.jupGate.minFees}  orgVol≥${p.jupGate.minOrganicVolumePct}%  orgBuyers≥${p.jupGate.minOrganicBuyersPct}%\n` +
+    `          labels: ${escapeHtml(labelsText)}\n` +
+    `<b>Buy</b>      ${p.buy.sizeSol} SOL\n` +
+    `<b>Exit</b>     strategy=${escapeHtml(p.exit.profitStrategyType)}  arm=${(p.exit.armPct * 100).toFixed(0)}%  trail=${(p.exit.trailPct * 100).toFixed(0)}%  stop=${(p.exit.stopPct * 100).toFixed(0)}%\n` +
+    (p.exit.ladderTargets.length > 0 ? `          ladder: ${escapeHtml(ladderText)}\n` : ``) +
+    `          runner: keep=${(p.exit.runnerKeepPct * 100).toFixed(0)}%  trail=${(p.exit.runnerTrailPct * 100).toFixed(0)}%  timeout=${Math.round(p.exit.runnerTimeoutSecs / 60)}m\n` +
+    `<b>OKX</b>      holders≥${(p.okxBaseline as Record<string, number>).minHolders ?? "?"}  liq≥${(p.okxBaseline as Record<string, number>).minLiquidityUsd ?? "?"}\n` +
+    `<b>GMGN</b>     holders≥${(p.gmgnBaseline as Record<string, number>).minHolders ?? "?"}  liq≥${(p.gmgnBaseline as Record<string, number>).minLiquidityUsd ?? "?"}`
+  );
+}
+
+async function handleShare(chatId: number): Promise<void> {
+  const payload = buildSharePayload();
+  const encoded = "MB1:" + Buffer.from(JSON.stringify(payload)).toString("base64");
+  const adoptKey = registerSharedAdopt(payload);
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `<b>📤 Share your MoonBags settings</b>\n\n` +
+      formatShareSummary(payload) + `\n\n` +
+      `<b>Payload (send with /import):</b>\n<code>${escapeHtml(encoded)}</code>`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ Adopt (apply to this bot)", callback_data: `adopt:import:${adoptKey}` },
+      ]],
+    },
+  });
+}
+
+async function handleImport(chatId: number, argText: string): Promise<void> {
+  const raw = argText.trim();
+  if (!raw) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "Usage: <code>/import MB1:&lt;base64&gt;</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  const b64 = raw.startsWith("MB1:") ? raw.slice(4) : raw;
+  let payload: SharePayload;
+  try {
+    payload = JSON.parse(Buffer.from(b64, "base64").toString("utf8")) as SharePayload;
+  } catch {
+    await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Could not decode payload — check it was copied in full." });
+    return;
+  }
+  if (payload.v !== 1 || (!payload.jupGate && !payload.okxBaseline)) {
+    await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Invalid payload (must have v:1 and jupGate or okxBaseline)." });
+    return;
+  }
+  const adoptKey = registerSharedAdopt(payload);
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `<b>📥 Imported settings preview</b>\n\n` +
+      formatShareSummary(payload) + `\n\n` +
+      `Tap the button to apply these settings live.`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ Adopt imported settings", callback_data: `adopt:import:${adoptKey}` },
+      ]],
+    },
+  });
+}
+
+async function applySharedAdopt(chatId: number, key: string): Promise<void> {
+  const entry = pendingSharedAdopts.get(key);
+  if (!entry) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "⚠️ Adopt link expired — run /share or /import again.",
+    });
+    return;
+  }
+  pendingSharedAdopts.delete(key);
+  const p = entry;
+
+  updateRuntimeSettings((draft) => {
+    // jupGate
+    draft.jupGate.minFees = p.jupGate.minFees;
+    draft.jupGate.allowedScoreLabels = p.jupGate.allowedScoreLabels;
+    draft.jupGate.minOrganicVolumePct = p.jupGate.minOrganicVolumePct;
+    draft.jupGate.minOrganicBuyersPct = p.jupGate.minOrganicBuyersPct;
+    // buy
+    draft.buy.sizeSol = p.buy.sizeSol;
+    // exit
+    draft.exit.profitStrategy.type = p.exit.profitStrategyType as typeof draft.exit.profitStrategy.type;
+    draft.exit.profitStrategy.fixedTargetPct = p.exit.fixedTargetPct;
+    draft.exit.profitStrategy.ladderTargets = p.exit.ladderTargets;
+    draft.exit.profitStrategy.trailRemainder = p.exit.trailRemainder;
+    draft.exit.trail.armPct = p.exit.armPct;
+    draft.exit.trail.trailPct = p.exit.trailPct;
+    draft.exit.risk.stopPct = p.exit.stopPct;
+    draft.exit.risk.maxHoldSecs = p.exit.maxHoldSecs;
+    draft.exit.runner.keepPct = p.exit.runnerKeepPct;
+    draft.exit.runner.trailPct = p.exit.runnerTrailPct;
+    draft.exit.runner.timeoutSecs = p.exit.runnerTimeoutSecs;
+    // milestones
+    draft.milestones.enabled = p.milestones.enabled;
+    draft.milestones.pcts = p.milestones.pcts;
+    // baselines & triggers
+    if (p.okxBaseline) {
+      const tgt = draft.signals.okx.discovery.baseline as unknown as Record<string, number | boolean>;
+      for (const [k, v] of Object.entries(p.okxBaseline)) tgt[k] = v;
+    }
+    if (p.okxTrigger) {
+      const tgt = draft.signals.okx.discovery.trigger as unknown as Record<string, number>;
+      for (const [k, v] of Object.entries(p.okxTrigger)) tgt[k] = v;
+    }
+    if (p.gmgnBaseline) {
+      const tgt = draft.signals.gmgn.baseline as unknown as Record<string, number | boolean>;
+      for (const [k, v] of Object.entries(p.gmgnBaseline)) tgt[k] = v;
+    }
+    if (p.gmgnTrigger) {
+      const tgt = draft.signals.gmgn.trigger as unknown as Record<string, number>;
+      for (const [k, v] of Object.entries(p.gmgnTrigger)) tgt[k] = v;
+    }
+  });
+
+  logger.info({ key }, "[settings] shared payload adopted");
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `✅ <b>Shared settings adopted</b>\n\n` +
+      formatShareSummary(p) + `\n\n` +
+      `<i>Applied live, persisted to state/settings.json. No restart needed.</i>`,
+    parse_mode: "HTML",
+  });
+}
+
+const TELEGRAM_SOFT_LIMIT = 3800;
+
+type NormalizedSweep = {
+  field: string;
+  label: string;
+  dir: "min" | "max";
+  rows: Array<{ threshold: number; n: number; winPct: number; medMax: number; medFinal: number; medMin: number }>;
+};
+
+function fmtPctSigned(n: number): string {
+  const rounded = Math.round(n);
+  return `${rounded >= 0 ? "+" : ""}${rounded}%`;
+}
+
+function normalizeOkxSweeps(sweeps: OkxSweepResult[]): NormalizedSweep[] {
+  return sweeps.map((s) => ({
+    field: s.field,
+    label: s.label,
+    dir: s.dir,
+    rows: s.rows.map((r) => ({
+      threshold: r.threshold,
+      n: r.n,
+      winPct: r.winPct,
+      medMax: r.medianMaxPnl,
+      medFinal: r.medianFinalPnl,
+      medMin: r.medianMinPnl,
+    })),
+  }));
+}
+
+function normalizeGmgnSweeps(sweeps: GmgnSweepResult[]): NormalizedSweep[] {
+  return sweeps.map((s) => ({
+    field: s.field,
+    label: s.label,
+    dir: s.dir,
+    rows: s.rows.map((r) => ({
+      threshold: r.threshold,
+      n: r.n,
+      winPct: r.winPct,
+      medMax: r.medianMaxPnl,
+      medFinal: r.medianFinalPnl,
+      medMin: r.medianMinPnl,
+    })),
+  }));
+}
+
+// Normalized categorical sweep (jup label sets). Structure-compatible between
+// okx / gmgn so formatters + adopt picker are source-agnostic.
+type NormalizedCategoricalSweep = {
+  field: string;
+  label: string;
+  options: Array<{
+    id: string;
+    label: string;
+    allowedLabels: string[];
+    n: number;
+    winPct: number;
+    medMax: number;
+    medFinal: number;
+    medMin: number;
+  }>;
+};
+
+function normalizeOkxCategorical(results: OkxCategoricalSweepResult[]): NormalizedCategoricalSweep[] {
+  return results.map((s) => ({
+    field: s.field,
+    label: s.label,
+    options: s.options.map((o) => ({
+      id: o.id,
+      label: o.label,
+      allowedLabels: o.allowedLabels,
+      n: o.n,
+      winPct: o.winPct,
+      medMax: o.medianMaxPnl,
+      medFinal: o.medianFinalPnl,
+      medMin: o.medianMinPnl,
+    })),
+  }));
+}
+
+function normalizeGmgnCategorical(results: GmgnCategoricalSweepResult[]): NormalizedCategoricalSweep[] {
+  return results.map((s) => ({
+    field: s.field,
+    label: s.label,
+    options: s.options.map((o) => ({
+      id: o.id,
+      label: o.label,
+      allowedLabels: o.allowedLabels,
+      n: o.n,
+      winPct: o.winPct,
+      medMax: o.medianMaxPnl,
+      medFinal: o.medianFinalPnl,
+      medMin: o.medianMinPnl,
+    })),
+  }));
+}
+
+function formatCategoricalBlock(sweep: NormalizedCategoricalSweep): string {
+  const lines: string[] = [];
+  lines.push(sweep.label);
+  // Show every option (small set) with summary stats.
+  for (const o of sweep.options) {
+    const labelSet = o.allowedLabels.length > 0 ? `[${o.allowedLabels.join("|")}]` : "[any]";
+    lines.push(
+      `  ${o.id.padEnd(12)} ${labelSet.padEnd(18)} n=${o.n} win% ${o.winPct.toFixed(0)} medMax ${fmtPctSigned(o.medMax)} medFinal ${fmtPctSigned(o.medFinal)} medMin ${fmtPctSigned(o.medMin)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+// Pick the option with highest winPct & n >= minN. Returns the allowedLabels
+// set (possibly empty = "any"), or null if nothing passes the n floor.
+function bestCategoricalOption(
+  sweep: NormalizedCategoricalSweep,
+  minN: number,
+): string[] | null {
+  const eligible = sweep.options.filter((o) => o.n >= minN);
+  if (eligible.length === 0) return null;
+  eligible.sort((a, b) => {
+    if (b.winPct !== a.winPct) return b.winPct - a.winPct;
+    return b.n - a.n;
+  });
+  return eligible[0]!.allowedLabels;
+}
+
+function formatSweepBlock(sweep: NormalizedSweep): string {
+  // Top 3 thresholds by winPct, ties broken by larger n (more robust), then larger medMax.
+  const sorted = [...sweep.rows].sort((a, b) => {
+    if (b.winPct !== a.winPct) return b.winPct - a.winPct;
+    if (b.n !== a.n) return b.n - a.n;
+    return b.medMax - a.medMax;
+  });
+  const top3 = sorted.slice(0, 3);
+  const op = sweep.dir === "min" ? "≥" : "≤";
+  const lines: string[] = [];
+  lines.push(sweep.label);
+  for (const r of top3) {
+    const t = Number.isInteger(r.threshold) ? String(r.threshold) : r.threshold.toFixed(2);
+    lines.push(
+      `  ${sweep.field} ${op} ${t}: n=${r.n} win% ${r.winPct.toFixed(0)} medMax ${fmtPctSigned(r.medMax)} medFinal ${fmtPctSigned(r.medFinal)} medMin ${fmtPctSigned(r.medMin)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+// Pick best threshold per sweep with n >= minN, ranked by winPct. Returns the
+// numeric threshold (or null if nothing passes the floor).
+function bestThresholdFor(sweep: NormalizedSweep, minN: number): number | null {
+  const eligible = sweep.rows.filter((r) => r.n >= minN);
+  if (eligible.length === 0) return null;
+  eligible.sort((a, b) => {
+    if (b.winPct !== a.winPct) return b.winPct - a.winPct;
+    return b.n - a.n;
+  });
+  return eligible[0]!.threshold;
+}
+
+// Build a suggested-baseline object keyed for signals.okx.discovery.baseline
+// (or signals.gmgn.baseline). Only include sweeps that map cleanly.
+const OKX_FIELD_TO_BASELINE_KEY: Record<string, string> = {
+  holders: "minHolders",
+  liquidityUsd: "minLiquidityUsd",
+  top10Pct: "maxTop10HolderRate",
+  bundleHoldPct: "maxBundlerRate",
+  devHoldPct: "maxCreatorBalanceRate",
+};
+
+const GMGN_FIELD_TO_BASELINE_KEY: Record<string, string> = {
+  liquidityUsd: "minLiquidityUsd",
+  holders: "minHolders",
+  top10Pct: "maxTop10HolderRate",
+  rugRatio: "maxRugRatio",
+  bundlerPct: "maxBundlerRate",
+  creatorBalancePct: "maxCreatorBalanceRate",
+};
+
+function buildSuggestedBaseline(
+  sweeps: NormalizedSweep[],
+  fieldMap: Record<string, string>,
+  minN: number,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const sweep of sweeps) {
+    const key = fieldMap[sweep.field];
+    if (!key) continue;
+    const best = bestThresholdFor(sweep, minN);
+    if (best === null) continue;
+    // Skip trivial zero/max thresholds that are effectively "no filter".
+    if (sweep.dir === "min" && best === 0) continue;
+    if (sweep.dir === "max" && best === 100) continue;
+    out[key] = best;
+  }
+  return out;
+}
+
+function splitIntoChunks(blocks: string[], openTag: string, closeTag: string): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const block of blocks) {
+    const candidate = current ? `${current}\n\n${block}` : block;
+    // +tag overhead
+    if ((openTag.length + candidate.length + closeTag.length) > TELEGRAM_SOFT_LIMIT && current) {
+      chunks.push(`${openTag}${current}${closeTag}`);
+      current = block;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(`${openTag}${current}${closeTag}`);
+  return chunks;
+}
+
+async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promise<void> {
+  if (filterSweepInFlight) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "⏳ Filter sweep already running. Wait for it to finish.",
+    });
+    return;
+  }
+  filterSweepInFlight = true;
+
+  const sourceLabel = source === "okx" ? "OKX" : "GMGN";
+  const startMsg = await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: `🔬 <b>Running ${sourceLabel} filter sweep...</b>\n<i>Harvesting candidates + fetching forward OHLCV. Takes ~2-3 minutes.</i>`,
+    parse_mode: "HTML",
+  }) as { result?: { message_id?: number } };
+  const statusId = startMsg?.result?.message_id;
+
+  let lastEdit = 0;
+  const editProgress = async (stage: string, pct: number): Promise<void> => {
+    if (!statusId) return;
+    const now = Date.now();
+    if (now - lastEdit < 1500 && pct < 100) return; // throttle
+    lastEdit = now;
+    try {
+      await tgPost("editMessageText", {
+        chat_id: chatId,
+        message_id: statusId,
+        text: `🔬 <b>Running ${sourceLabel} filter sweep...</b>\n<i>${escapeHtml(stage)} (${pct}%)</i>`,
+        parse_mode: "HTML",
+      });
+    } catch {
+      // ignore transient edit failures
+    }
+  };
+
+  try {
+    let totalTokens = 0;
+    let withOhlcv = 0;
+    let csvPath = "";
+    let normalizedSweeps: NormalizedSweep[] = [];
+    let normalizedCategorical: NormalizedCategoricalSweep[] = [];
+    let byTimeFrame: Array<{ tfLabel: string; n: number; winPct: number }> = [];
+    let baselineKeyPrefix = "";
+    let fieldMap: Record<string, string> = {};
+
+    if (source === "okx") {
+      const result: OkxFilterAnalysisResult = await runOkxFilterAnalysis({
+        onProgress: (stage, pct) => { void editProgress(stage, pct); },
+      });
+      totalTokens = result.totalTokens;
+      withOhlcv = result.withOhlcv;
+      csvPath = result.csvPath;
+      normalizedSweeps = normalizeOkxSweeps(result.sweeps);
+      normalizedCategorical = normalizeOkxCategorical(result.sweepsCategorical ?? []);
+      byTimeFrame = result.byTimeFrame.map((t) => ({ tfLabel: t.tfLabel, n: t.n, winPct: t.winPct }));
+      baselineKeyPrefix = "signals.okx.discovery.baseline";
+      fieldMap = OKX_FIELD_TO_BASELINE_KEY;
+    } else {
+      const result: GmgnFilterAnalysisResult = await runGmgnFilterAnalysis({
+        onProgress: (stage, pct) => { void editProgress(stage, pct); },
+      });
+      totalTokens = result.totalTokens;
+      withOhlcv = result.withOhlcv;
+      csvPath = result.csvPath;
+      normalizedSweeps = normalizeGmgnSweeps(result.sweeps);
+      normalizedCategorical = normalizeGmgnCategorical(result.sweepsCategorical ?? []);
+      byTimeFrame = result.byTimeFrame.map((t) => ({ tfLabel: t.tfLabel, n: t.n, winPct: t.winPct }));
+      baselineKeyPrefix = "signals.gmgn.baseline";
+      fieldMap = GMGN_FIELD_TO_BASELINE_KEY;
+    }
+
+    if (totalTokens === 0) {
+      const msg = `❌ ${sourceLabel} filter sweep returned no candidates. Check API connectivity.`;
+      if (statusId) {
+        await tgPost("editMessageText", { chat_id: chatId, message_id: statusId, text: msg });
+      } else {
+        await tgPost("sendMessage", { chat_id: chatId, text: msg });
+      }
+      return;
+    }
+
+    if (withOhlcv === 0) {
+      const msg = `❌ ${sourceLabel} filter sweep: ${totalTokens} candidates but none had forward OHLCV.`;
+      if (statusId) {
+        await tgPost("editMessageText", { chat_id: chatId, message_id: statusId, text: msg });
+      } else {
+        await tgPost("sendMessage", { chat_id: chatId, text: msg });
+      }
+      return;
+    }
+
+    // --- Build output ---
+    const header: string[] = [];
+    header.push(`🔬 <b>${sourceLabel} filter sweep</b>`);
+    header.push(`${totalTokens} tokens · ${withOhlcv} with forward OHLCV · winner = maxPnL ≥ 50%`);
+    header.push(`CSV: <code>${escapeHtml(csvPath)}</code>`);
+    if (byTimeFrame.length > 0) {
+      const tfLine = byTimeFrame
+        .filter((t) => t.n > 0)
+        .map((t) => `${t.tfLabel} n=${t.n} win%${t.winPct.toFixed(0)}`)
+        .join(" · ");
+      if (tfLine) header.push(`By ${source === "okx" ? "time-frame" : "source"}: ${tfLine}`);
+    }
+
+    // Sweep <pre> blocks — each shows top 3 thresholds by winPct.
+    // Render fees sweep (jupGate) at the end alongside the categorical
+    // label sweep for better readability.
+    const mainSweeps = normalizedSweeps.filter((s) => s.field !== "fees");
+    const feesSweeps = normalizedSweeps.filter((s) => s.field === "fees");
+    const sweepBlocks = mainSweeps.map((s) => formatSweepBlock(s));
+    const jupSweepBlocks: string[] = [
+      ...feesSweeps.map((s) => formatSweepBlock(s)),
+      ...normalizedCategorical.map((c) => formatCategoricalBlock(c)),
+    ];
+
+    // Suggested baseline
+    const suggested = buildSuggestedBaseline(normalizedSweeps, fieldMap, 20);
+    const suggestedKeys = Object.keys(suggested);
+
+    // Jup-gate suggestions: minFees from the fees sweep + allowedScoreLabels
+    // from the categorical sweep. Both demand n >= 20 to match the main
+    // baseline picker.
+    const feesSweep = feesSweeps[0];
+    const bestFees = feesSweep ? bestThresholdFor(feesSweep, 20) : null;
+    const labelsSweep = normalizedCategorical[0];
+    const bestLabels = labelsSweep ? bestCategoricalOption(labelsSweep, 20) : null;
+    const organicVolSweep = normalizedSweeps.find((s) => s.field === "organicVolumePct") ?? null;
+    const organicBuyersSweep = normalizedSweeps.find((s) => s.field === "organicBuyersPct") ?? null;
+    const bestOrgVol = organicVolSweep ? bestThresholdFor(organicVolSweep, 20) : null;
+    const bestOrgBuyers = organicBuyersSweep ? bestThresholdFor(organicBuyersSweep, 20) : null;
+
+    const jupGatePayload: JupGateAdoptPayload = {};
+    const jupGateDisplay: Record<string, unknown> = {};
+    // Skip trivial threshold 0 (= "no filter") for fees, matching the
+    // baseline builder's behaviour for direction=min.
+    if (bestFees !== null && bestFees > 0) {
+      jupGatePayload.minFees = bestFees;
+      jupGateDisplay["jupGate.minFees"] = bestFees;
+    }
+    if (bestLabels !== null) {
+      jupGatePayload.allowedScoreLabels = bestLabels;
+      jupGateDisplay["jupGate.allowedScoreLabels"] = bestLabels;
+    }
+    if (bestOrgVol !== null && bestOrgVol > 0) {
+      jupGatePayload.minOrganicVolumePct = bestOrgVol;
+      jupGateDisplay["jupGate.minOrganicVolumePct"] = bestOrgVol;
+    }
+    if (bestOrgBuyers !== null && bestOrgBuyers > 0) {
+      jupGatePayload.minOrganicBuyersPct = bestOrgBuyers;
+      jupGateDisplay["jupGate.minOrganicBuyersPct"] = bestOrgBuyers;
+    }
+    const hasJupGateSuggestion = Object.keys(jupGatePayload).length > 0;
+
+    const suggestedLines: string[] = [];
+    suggestedLines.push(`<b>Suggested baseline + Jup gate</b> (paste into <code>${escapeHtml(baselineKeyPrefix)}</code> + <code>jupGate</code>)`);
+    if (suggestedKeys.length === 0 && !hasJupGateSuggestion) {
+      suggestedLines.push(`<i>No sweep cleared the n≥20 floor — not enough data.</i>`);
+    } else {
+      const combined: Record<string, unknown> = { ...suggested, ...jupGateDisplay };
+      suggestedLines.push(`<pre>${escapeHtml(JSON.stringify(combined, null, 2))}</pre>`);
+    }
+
+    // First message: header + first batch of sweeps.
+    const headerText = header.join("\n");
+    const preChunks = splitIntoChunks(sweepBlocks, "<pre>", "</pre>");
+    const jupPreChunks = jupSweepBlocks.length > 0
+      ? splitIntoChunks(jupSweepBlocks, "<pre>", "</pre>")
+      : [];
+    const suggestedText = suggestedLines.join("\n");
+
+    // Try to fit first <pre> chunk into the status-edit message alongside the
+    // header; otherwise send header alone and push remaining chunks after.
+    const firstChunk = preChunks[0] ?? "";
+    const combinedFirst = `${headerText}\n\n${firstChunk}`;
+    const firstFits = combinedFirst.length <= TELEGRAM_SOFT_LIMIT;
+    const firstMessageText = firstFits ? combinedFirst : headerText;
+    const restChunks = firstFits ? preChunks.slice(1) : preChunks;
+
+    if (statusId) {
+      await tgPost("editMessageText", {
+        chat_id: chatId,
+        message_id: statusId,
+        text: firstMessageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    } else {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: firstMessageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    for (const chunk of restChunks) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: chunk,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    // Jup-gate blocks (fees sweep + categorical label sweep) rendered at the
+    // end so they don't get buried in the baseline sweep list.
+    for (const chunk of jupPreChunks) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: chunk,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    if (suggestedKeys.length > 0 || hasJupGateSuggestion) {
+      const adoptKey = registerFilterAdopt(source, suggested, jupGatePayload);
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: suggestedText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ Adopt ${sourceLabel} baseline + Jup gate`, callback_data: `adopt:filter:${adoptKey}` },
+          ]],
+        },
+      });
+    } else {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: suggestedText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "[telegram] filter sweep failed");
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: `❌ Filter sweep failed: ${escapeHtml((err as Error).message)}`,
+      parse_mode: "HTML",
+    });
+  } finally {
+    filterSweepInFlight = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // /update — pull origin/main and restart through pm2.
 // ---------------------------------------------------------------------------
 function formatUpdateBlocker(blocker: UpdateBlocker, preview?: UpdatePreview): string[] {
@@ -1544,6 +3064,73 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
   const parts = data.split(":");
   if (parts[1] === "cancel") {
     await tgPost("sendMessage", { chat_id: chatId, text: "❌ Cancelled. Config unchanged." });
+    return;
+  }
+  if (parts[1] === "import") {
+    await applySharedAdopt(chatId, parts[2] ?? "");
+    return;
+  }
+  if (parts[1] === "filter") {
+    const key = parts[2];
+    const entry = key ? pendingFilterAdopts.get(key) : undefined;
+    if (!entry) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: "⚠️ Adopt link expired — run /backtest filter sweep again.",
+      });
+      return;
+    }
+    pendingFilterAdopts.delete(key!);
+    const { source, baseline, jupGate } = entry;
+    const sourceLabel = source === "okx" ? "OKX" : "GMGN";
+    updateRuntimeSettings((draft) => {
+      if (source === "okx") {
+        const target = draft.signals.okx.discovery.baseline as unknown as Record<string, number>;
+        for (const [k, v] of Object.entries(baseline)) target[k] = v;
+      } else {
+        const target = draft.signals.gmgn.baseline as unknown as Record<string, number>;
+        for (const [k, v] of Object.entries(baseline)) target[k] = v;
+      }
+      // Jup gate is cross-source; apply whichever fields were suggested.
+      if (typeof jupGate.minFees === "number") {
+        draft.jupGate.minFees = jupGate.minFees;
+      }
+      if (Array.isArray(jupGate.allowedScoreLabels)) {
+        draft.jupGate.allowedScoreLabels = jupGate.allowedScoreLabels;
+      }
+      if (typeof jupGate.minOrganicVolumePct === "number") {
+        draft.jupGate.minOrganicVolumePct = jupGate.minOrganicVolumePct;
+      }
+      if (typeof jupGate.minOrganicBuyersPct === "number") {
+        draft.jupGate.minOrganicBuyersPct = jupGate.minOrganicBuyersPct;
+      }
+    });
+    const appliedLines = Object.entries(baseline).map(([k, v]) => `  ${k}: ${v}`);
+    if (typeof jupGate.minFees === "number") {
+      appliedLines.push(`  jupGate.minFees: ${jupGate.minFees}`);
+    }
+    if (Array.isArray(jupGate.allowedScoreLabels)) {
+      const labelsText = jupGate.allowedScoreLabels.length > 0
+        ? JSON.stringify(jupGate.allowedScoreLabels)
+        : "[] (any)";
+      appliedLines.push(`  jupGate.allowedScoreLabels: ${labelsText}`);
+    }
+    if (typeof jupGate.minOrganicVolumePct === "number") {
+      appliedLines.push(`  jupGate.minOrganicVolumePct: ${jupGate.minOrganicVolumePct}`);
+    }
+    if (typeof jupGate.minOrganicBuyersPct === "number") {
+      appliedLines.push(`  jupGate.minOrganicBuyersPct: ${jupGate.minOrganicBuyersPct}`);
+    }
+    const applied = appliedLines.join("\n");
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `✅ <b>Adopted ${sourceLabel} baseline + Jup gate</b>\n` +
+        `<pre>${escapeHtml(applied)}</pre>\n` +
+        `Applied live, persisted to state/settings.json.`,
+      parse_mode: "HTML",
+    });
+    logger.info({ source, applied: baseline, jupGate }, "[settings] filter-sweep baseline adopted");
     return;
   }
   if (parts[1] === "fixed") {
@@ -1845,19 +3432,23 @@ export function startTelegramBot(): () => void {
       { command: "mcapfilter", description: "Set MCap entry filter (e.g. /mcapfilter 50000 200000 or off)" },
       { command: "history",   description: "Last N closed trades (default 10)" },
       { command: "settings",  description: "Edit trading params live (no restart)" },
+      { command: "sources",   description: "Signal source mode + SCG/OKX/GMGN status" },
       { command: "llm",       description: "Toggle the LLM exit advisor on/off" },
-      { command: "pause",     description: "Stop taking new SCG alerts" },
-      { command: "resume",    description: "Resume taking new SCG alerts" },
+      { command: "wss",       description: "OKX WSS status + open-position acceleration toggle" },
+      { command: "pause",     description: "Stop taking new entry alerts" },
+      { command: "resume",    description: "Resume taking new entry alerts" },
       { command: "ping",      description: "Check upstream alerts API + poller + Telegram" },
       { command: "sellall",   description: "Emergency close-all (requires CONFIRM)" },
       { command: "skip",      description: "Blacklist a mint (or list/clear)" },
       { command: "mint",      description: "On-demand on-chain snapshot of any token" },
       { command: "wallet",    description: "Show wallet address + SOL balance" },
-      { command: "backtest",        description: "Run simple backtest (ARM × TRAIL × STOP) + adopt live" },
-      { command: "backtest_hybrid", description: "Run hybrid backtest (adds moonbag grid — only fires when LLM mode is OFF)" },
+      { command: "backtest",        description: "Backtest exit strategies against GMGN candidates + one-tap adopt" },
+      { command: "backtest_hybrid", description: "Same as /backtest hybrid (adds moonbag grid)" },
       { command: "doctor",    description: "Run setup and runtime health checks" },
       { command: "setup_status", description: "Show setup checklist" },
       { command: "update",    description: "Pull latest code and restart via pm2" },
+      { command: "share",     description: "Share your filter/exit settings as a compact payload" },
+      { command: "import",    description: "Import shared settings: /import MB1:<payload>" },
     ],
   });
 
@@ -1904,6 +3495,12 @@ export function startTelegramBot(): () => void {
             await applyEdit(chatId, key, text);
             continue;
           }
+          if (replyToId !== undefined && pendingRuntimeEdits.has(replyToId)) {
+            const key = pendingRuntimeEdits.get(replyToId)!;
+            pendingRuntimeEdits.delete(replyToId);
+            await applyRuntimeEdit(chatId, key, text);
+            continue;
+          }
 
           // Awaiting CONFIRM for /sellall?
           if (pendingSellAll.has(chatId)) {
@@ -1926,11 +3523,13 @@ export function startTelegramBot(): () => void {
               case "/start":     await sendStartMenu(chatId); break;
               case "/positions": await sendPositions(chatId); break;
               case "/settings":  await sendSettingsMenu(chatId); break;
+              case "/sources":   await handleSources(chatId); break;
               case "/pnl":       await handlePnl(chatId); break;
               case "/stats":        await handleStats(chatId); break;
               case "/mcapfilter":  await handleMcapFilter(chatId, argText); break;
               case "/history":   await handleHistory(chatId, argText); break;
               case "/llm":       await handleLlm(chatId); break;
+              case "/wss":       await handleWss(chatId); break;
               case "/pause":     await handlePause(chatId); break;
               case "/resume":    await handleResume(chatId); break;
               case "/ping":      await handlePing(chatId); break;
@@ -1943,6 +3542,8 @@ export function startTelegramBot(): () => void {
               case "/doctor":    await handleDoctor(chatId); break;
               case "/setup_status": await handleSetupStatus(chatId); break;
               case "/update":    await handleUpdate(chatId); break;
+              case "/share":     await handleShare(chatId); break;
+              case "/import":    await handleImport(chatId, argText); break;
             }
           } catch (err) {
             logger.warn({ err: (err as Error).message, cmd }, "[telegram] command handler threw");

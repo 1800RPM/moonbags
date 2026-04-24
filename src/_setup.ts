@@ -223,6 +223,16 @@ async function main(): Promise<void> {
   if (okxPassphrase) collected.OKX_PASSPHRASE = okxPassphrase;
   else if (!okxPassphraseFromEnv) collected.OKX_PASSPHRASE = "";
 
+  console.log("");
+  console.log(gray("   GMGN source scanner key — enables GMGN Watch/Live in /sources."));
+  console.log(gray("   Recommended alongside OKX for the early-buy strategy (trenches + smart-money calls)."));
+  console.log(`   Get one at:  ${blue("https://gmgn.ai/ai?chain=sol")}`);
+  const gmgnKeyFromEnv = existingEnv.match(/^GMGN_API_KEY=(.*)$/m)?.[1];
+  if (gmgnKeyFromEnv) console.log(`   ${dim(`current GMGN_API_KEY: ${gmgnKeyFromEnv.slice(0, 10)}...`)}`);
+  const gmgnKey = await ask(`   ${bold("GMGN_API_KEY")} ${dim("(blank to keep/skip)")}: `);
+  if (gmgnKey) collected.GMGN_API_KEY = gmgnKey;
+  else if (!gmgnKeyFromEnv) collected.GMGN_API_KEY = "";
+
   // 3. Jupiter API key
   section("Jupiter API key", 3);
   console.log(gray("   Jupiter Ultra provides swap routing (buy/sell execution)."));
@@ -331,20 +341,27 @@ async function main(): Promise<void> {
     }
   }
 
-  // 7. MiniMax (optional)
-  section("MiniMax API key — LLM exit advisor (optional)", 7);
-  console.log(gray("   Off by default. If enabled, MiniMax M2.7 manages exits for"));
-  console.log(gray("   armed positions using live on-chain data. You can flip it on"));
-  console.log(gray("   later via /llm in Telegram."));
-  console.log(`   Referral link (10% off):  ${blue("https://platform.minimax.io/subscribe/token-plan?code=K0Q2oDUiwK&source=link")}`);
+  // 7. LLM exit advisor (optional)
+  section("LLM exit advisor — API key (optional)", 7);
+  console.log(gray("   Off by default. If enabled, an LLM manages exits for armed positions"));
+  console.log(gray("   using live on-chain data. Enable later via /llm in Telegram."));
+  console.log(gray("   Supports MiniMax (default) or any OpenAI-compatible provider (OpenRouter etc)."));
   console.log("");
+  console.log(gray("   Option A — MiniMax (recommended default):"));
+  console.log(`   Referral link (10% off):  ${blue("https://platform.minimax.io/subscribe/token-plan?code=K0Q2oDUiwK&source=link")}`);
   const mmFromEnv = existingEnv.match(/^MINIMAX_API_KEY=(.*)$/m)?.[1];
-  if (mmFromEnv) console.log(`   ${dim(`current: ${mmFromEnv.slice(0, 12)}...`)}`);
-  const mmKey = await ask(`   ${bold("MINIMAX_API_KEY")} ${dim("(blank to skip)")}: `);
+  const llmKeyFromEnv = existingEnv.match(/^LLM_API_KEY=(.*)$/m)?.[1];
+  if (mmFromEnv || llmKeyFromEnv) console.log(`   ${dim(`current key: set`)}`);
+  console.log("");
+  const mmKey = await ask(`   ${bold("MINIMAX_API_KEY")} ${dim("(blank to skip or use LLM_API_KEY instead)")}: `);
   if (mmKey) {
     collected.MINIMAX_API_KEY = mmKey;
     console.log(gray("   Enable LLM Managed later from Telegram /settings -> Exit Strategy."));
   }
+  console.log("");
+  console.log(gray("   Option B — OpenRouter or other OpenAI-compatible provider:"));
+  console.log(gray("   Set LLM_API_KEY, LLM_ENDPOINT, and LLM_MODEL in .env manually after setup."));
+  console.log(gray("   Example: LLM_ENDPOINT=https://openrouter.ai/api/v1/chat/completions"));
 
   // 8. Trading params
   section("Trading parameters", 8);
@@ -374,6 +391,7 @@ async function main(): Promise<void> {
   if (!existingEnv.match(/^SCG_POLL_MS=/m)) collected.SCG_POLL_MS = "3000";
   if (!existingEnv.match(/^PRICE_POLL_MS=/m)) collected.PRICE_POLL_MS = "3000";
   if (!existingEnv.match(/^LLM_POLL_MS=/m)) collected.LLM_POLL_MS = "30000";
+  if (!existingEnv.match(/^OKX_WSS_ENABLED=/m)) collected.OKX_WSS_ENABLED = "false";
   if (!existingEnv.match(/^SLIPPAGE_BPS=/m)) collected.SLIPPAGE_BPS = "2500";
   if (!existingEnv.match(/^MAX_ALERT_AGE_MINS=/m)) collected.MAX_ALERT_AGE_MINS = "0";
   if (!existingEnv.match(/^MIN_LIQUIDITY_USD=/m)) collected.MIN_LIQUIDITY_USD = "0";

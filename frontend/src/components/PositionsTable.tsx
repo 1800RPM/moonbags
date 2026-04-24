@@ -100,11 +100,6 @@ function PositionCard({ p, info, kline }: { p: Position; info?: TokenInfo; kline
     : 1;
   const drawdownPct = Math.max(0, Math.min(1, drawdownFromPeak)) * 100;
 
-  const onSell = () => {
-    // Sell endpoint not yet wired on backend
-    console.log("SELL", p.mint);
-  };
-
   const onCopy = (e: React.MouseEvent) => {
     e.stopPropagation();
     navigator.clipboard?.writeText(p.mint).catch(() => {});
@@ -116,125 +111,137 @@ function PositionCard({ p, info, kline }: { p: Position; info?: TokenInfo; kline
 
   return (
     <div
-      className={`group h-[120px] bg-surface-container-low border border-outline-variant/10 ${TONE_HOVER_BORDER[tone]} transition-all flex items-center px-6 gap-6 relative overflow-hidden rounded-md motion-safe:animate-in motion-safe:slide-in-from-right motion-safe:duration-300`}
+      className={`group bg-surface-container-low border border-outline-variant/10 ${TONE_HOVER_BORDER[tone]} transition-all relative overflow-hidden rounded-md motion-safe:animate-in motion-safe:slide-in-from-right motion-safe:duration-300`}
     >
       {/* Left accent strip */}
       <div className={`absolute left-0 top-0 bottom-0 w-1 ${TONE_ACCENT[tone]}`} aria-hidden="true" />
 
-      {/* Avatar with colored ring */}
-      <div className={`relative shrink-0 rounded-full border-2 ${TONE_RING[tone]} p-1`}>
-        <TokenAvatar icon={info?.icon} name={p.name} size={56} />
-      </div>
+      <div className="flex flex-col gap-4 p-4 md:flex-row md:items-center md:px-6 md:py-4 md:min-h-[120px]">
+        <div className="flex items-start gap-4 min-w-0 flex-1">
+          {/* Avatar with colored ring */}
+          <div className={`relative shrink-0 rounded-full border-2 ${TONE_RING[tone]} p-1`}>
+            <TokenAvatar icon={info?.icon} name={p.name} size={56} />
+          </div>
 
-      {/* Middle column: name + PnL row + drawdown bar */}
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-1 flex-wrap">
-          <span className="font-display font-bold text-xl tracking-tight truncate">{p.name}</span>
-          {info?.symbol && (
-            <span className="font-mono text-xs text-muted-foreground">${info.symbol}</span>
-          )}
-          {p.armed && (
-            <span className="px-1.5 py-0.5 bg-pepe text-background text-[9px] font-mono font-bold rounded-sm">
-              ARMED
-            </span>
-          )}
-          {/* Mint + external links */}
-          <button
-            onClick={onCopy}
-            className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            aria-label={`Copy mint address ${p.mint}`}
-            title="Copy mint"
-          >
-            <span>{truncMint(p.mint)}</span>
-            <Copy className="h-3 w-3" aria-hidden="true" />
-          </button>
-          <a
-            href={`https://gmgn.ai/sol/token/${p.mint}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-1 font-mono text-[10px] text-pepe hover:text-pepe/80 transition-colors"
-            title="Open on GMGN"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <span>GMGN</span>
-            <ExternalLink className="h-3 w-3" aria-hidden="true" />
-          </a>
-          <a
-            href={`https://jup.ag/tokens/${p.mint}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-1 font-mono text-[10px] text-earth hover:text-earth/80 transition-colors"
-            title="Open on Jupiter"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <span>JUP</span>
-            <ExternalLink className="h-3 w-3" aria-hidden="true" />
-          </a>
-        </div>
-
-        <div className="flex items-end gap-4">
-          <span className={`text-3xl font-mono font-bold tabular-nums ${TONE_TEXT[tone]}`}>
-            {hasEntry ? `${pnlPositive ? "+" : ""}${(pnl * 100).toFixed(0)}%` : "—"}
-          </span>
-          <div className="flex-1 max-w-[180px] pb-2">
-            <div className="h-1 bg-surface-container-lowest w-full rounded-full overflow-hidden">
-              <div
-                className={`h-full ${TONE_ACCENT[tone]} transition-[width] duration-500`}
-                style={{ width: `${drawdownPct}%` }}
-              />
+          {/* Main content */}
+          <div className="min-w-0 flex-1 space-y-3">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-display font-bold text-lg md:text-xl tracking-tight truncate">{p.name}</span>
+              {info?.symbol && (
+                <span className="font-mono text-xs text-muted-foreground">${info.symbol}</span>
+              )}
+              {p.armed && (
+                <span className="px-1.5 py-0.5 bg-pepe text-background text-[9px] font-mono font-bold rounded-sm">
+                  ARMED
+                </span>
+              )}
+              <button
+                onClick={onCopy}
+                className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                aria-label={`Copy mint address ${p.mint}`}
+                title="Copy mint"
+              >
+                <span>{truncMint(p.mint)}</span>
+                <Copy className="h-3 w-3" aria-hidden="true" />
+              </button>
+              <a
+                href={`https://gmgn.ai/sol/token/${p.mint}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 font-mono text-[10px] text-pepe hover:text-pepe/80 transition-colors"
+                title="Open on GMGN"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <span>GMGN</span>
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+              </a>
+              <a
+                href={`https://jup.ag/tokens/${p.mint}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 font-mono text-[10px] text-earth hover:text-earth/80 transition-colors"
+                title="Open on Jupiter"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <span>JUP</span>
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+              </a>
             </div>
-            <span className="text-[8px] font-mono text-muted-foreground uppercase tracking-widest">
-              DRAWDOWN LIMIT
-            </span>
+
+            <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-end gap-4">
+                  <span className={`text-3xl font-mono font-bold tabular-nums ${TONE_TEXT[tone]}`}>
+                    {hasEntry ? `${pnlPositive ? "+" : ""}${(pnl * 100).toFixed(0)}%` : "—"}
+                  </span>
+                  <div className="flex-1 max-w-[220px] pb-2">
+                    <div className="h-1 bg-surface-container-lowest w-full rounded-full overflow-hidden">
+                      <div
+                        className={`h-full ${TONE_ACCENT[tone]} transition-[width] duration-500`}
+                        style={{ width: `${drawdownPct}%` }}
+                      />
+                    </div>
+                    <span className="text-[8px] font-mono text-muted-foreground uppercase tracking-widest">
+                      DRAWDOWN LIMIT
+                    </span>
+                  </div>
+                </div>
+
+                {info && (
+                  <div className="mt-2">
+                    <TokenInfoBadges info={info} compact />
+                  </div>
+                )}
+              </div>
+
+              <div className="w-full md:w-[132px] shrink-0">
+                {haveKline ? (
+                  <div className="flex flex-col items-end">
+                    <MiniPriceChart
+                      closes={kline}
+                      tone={tone}
+                      entryPriceUsd={info?.priceUsd && hasEntry
+                        ? info.priceUsd / (p.currentPricePerTokenSol / p.entryPricePerTokenSol)
+                        : undefined}
+                      width={132}
+                      height={48}
+                    />
+                    <span className="text-[8px] font-mono text-muted-foreground uppercase tracking-widest mt-0.5">
+                      1m · {kline.length}
+                    </span>
+                  </div>
+                ) : (
+                  <div
+                    className="flex flex-col items-center justify-center w-full h-12 text-[9px] font-mono text-muted-foreground/60 uppercase tracking-widest border border-dashed border-outline-variant/20 rounded-sm"
+                    aria-hidden="true"
+                  >
+                    loading kline…
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </div>
 
-        {info && (
-          <div className="mt-1 hidden lg:block">
-            <TokenInfoBadges info={info} compact />
+        <div className="flex items-center justify-between gap-3 md:w-[152px] md:flex-col md:items-stretch md:justify-center shrink-0">
+          <div className="rounded-sm border border-outline-variant/20 bg-surface-container-high/40 px-3 py-2">
+            <div className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
+              Manual Exit
+            </div>
+            <div className="font-mono text-[11px] font-bold uppercase tracking-wide text-foreground">
+              Unavailable
+            </div>
           </div>
-        )}
+          <div className="rounded-sm border border-pepe/20 bg-pepe/10 px-3 py-2 text-right md:text-left">
+            <div className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
+              Position
+            </div>
+            <div className="font-mono text-[11px] font-bold uppercase tracking-wide text-pepe">
+              Bot managed
+            </div>
+          </div>
+        </div>
       </div>
-
-      {/* Real 1m price chart — last ~60 min OKX closes */}
-      {haveKline ? (
-        <div className="hidden md:flex flex-col items-end shrink-0">
-          <MiniPriceChart
-            closes={kline}
-            tone={tone}
-            entryPriceUsd={info?.priceUsd && hasEntry
-              ? info.priceUsd / (p.currentPricePerTokenSol / p.entryPricePerTokenSol)
-              : undefined}
-            width={132}
-            height={48}
-          />
-          <span className="text-[8px] font-mono text-muted-foreground uppercase tracking-widest mt-0.5">
-            1m · {kline.length}
-          </span>
-        </div>
-      ) : (
-        <div
-          className="hidden md:flex flex-col items-center justify-center shrink-0 w-32 h-12 text-[9px] font-mono text-muted-foreground/60 uppercase tracking-widest border border-dashed border-outline-variant/20 rounded-sm"
-          aria-hidden="true"
-        >
-          loading kline…
-        </div>
-      )}
-
-      {/* Right: SELL button */}
-      <button
-        onClick={onSell}
-        disabled
-        aria-label={`Sell ${p.name} (not yet wired to backend)`}
-        title="Manual sell endpoint not yet wired"
-        className={`shrink-0 font-mono font-bold px-6 py-2 text-xs rounded-sm transition-all active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed ${
-          pnlPositive
-            ? "bg-coral text-background hover:opacity-90"
-            : "bg-surface-container-highest text-foreground hover:bg-surface-container-high"
-        }`}
-      >
-        SELL
-      </button>
     </div>
   );
 }
