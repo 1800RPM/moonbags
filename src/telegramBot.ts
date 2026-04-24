@@ -405,7 +405,9 @@ const SETTINGS_LABELS: Record<SettableKey, string> = {
   TRAIL_PCT:                "📉 Trail",
   STOP_PCT:                 "🛑 Stop loss",
   MAX_HOLD_SECS:            "⏱ Max hold",
-  LLM_EXIT_ENABLED:         "🧠 LLM advisor",
+  LLM_EXIT_ENABLED:         "🧠 LLM exit advisor",
+  LLM_ENTRY_ENABLED:        "🚪 LLM entry gate",
+  LLM_EXIT_IMMEDIATE:       "⚡ LLM immediate exit",
   LLM_POLL_MS:              "🧠 LLM poll interval",
   MILESTONES_ENABLED:       "🎯 Milestones",
   MILESTONE_PCTS:           "🎯 Milestone %s",
@@ -699,12 +701,25 @@ async function sendStartMenu(chatId: number): Promise<void> {
   const open = getPositions().filter((p) => p.status === "open" || p.status === "opening");
 
   const armed = open.filter((p) => p.armed).length;
-  const llmActive = CONFIG.LLM_EXIT_ENABLED && Boolean(CONFIG.LLM_API_KEY);
+  const keySet = Boolean(CONFIG.LLM_API_KEY);
+  const entryOn = CONFIG.LLM_ENTRY_ENABLED && keySet;
+  const exitOn = CONFIG.LLM_EXIT_ENABLED && keySet;
+  const immediateOn = CONFIG.LLM_EXIT_IMMEDIATE && keySet;
   const mode = stats.dryRun ? "🧪 DRY" : "🟢 LIVE";
   const pnlIcon = stats.realizedPnlSol >= 0 ? "🟢" : "🔴";
   const pnlSign = stats.realizedPnlSol >= 0 ? "+" : "";
-  const llmIcon = llmActive ? "🤖 ON" : "⚪️ OFF";
   const shortAddr = addr ? `${addr.slice(0, 4)}…${addr.slice(-4)}` : "—";
+
+  const llmLine = (() => {
+    if (!keySet) return `🧠 LLM: <i>no API key set</i>`;
+    const parts: string[] = [];
+    if (entryOn) parts.push("🚪 entry");
+    if (exitOn) parts.push("📤 exit");
+    if (immediateOn) parts.push("⚡ immediate");
+    return parts.length > 0
+      ? `🧠 LLM: <b>${parts.join("  ·  ")}</b>`
+      : `🧠 LLM: ⚪️ all off  <i>(/llm to enable)</i>`;
+  })();
 
   const text =
     `<b>🌙 MoonBags</b>  |  ${mode}\n` +
@@ -713,8 +728,8 @@ async function sendStartMenu(chatId: number): Promise<void> {
     `📊 Open positions: <b>${open.length}</b> / ${stats.maxConcurrent}  ${armed > 0 ? `(${armed} armed ⚡)` : ""}\n` +
     `${pnlIcon} Realized PnL: <b>${pnlSign}${stats.realizedPnlSol.toFixed(4)} SOL</b>\n` +
     `\n` +
-    `⚙️ Buy size: ${CONFIG.BUY_SIZE_SOL} SOL  |  arm: +${(CONFIG.ARM_PCT * 100).toFixed(0)}%  trail: ${(CONFIG.TRAIL_PCT * 100).toFixed(0)}%  stop: -${(CONFIG.STOP_PCT * 100).toFixed(0)}%\n` +
-    `🧠 LLM advisor: ${llmIcon}\n` +
+    `⚙️ Buy: ${CONFIG.BUY_SIZE_SOL} SOL  ·  arm +${(CONFIG.ARM_PCT * 100).toFixed(0)}%  ·  trail ${(CONFIG.TRAIL_PCT * 100).toFixed(0)}%  ·  stop -${(CONFIG.STOP_PCT * 100).toFixed(0)}%\n` +
+    `${llmLine}\n` +
     `⏱ Uptime: ${fmtUptime(stats.bootAt)}\n` +
     `👛 Wallet: <code>${escapeHtml(shortAddr)}</code>`;
 
@@ -726,7 +741,7 @@ async function sendStartMenu(chatId: number): Promise<void> {
     reply_markup: {
       inline_keyboard: [
         [{ text: "📊 Positions", callback_data: "menu:positions" }, { text: "⚙️ Settings", callback_data: "menu:settings" }],
-        [{ text: "🔄 Refresh", callback_data: "menu:refresh" }],
+        [{ text: "🧠 LLM modes", callback_data: "menu:llm" }, { text: "🔄 Refresh", callback_data: "menu:refresh" }],
       ],
     },
   });
@@ -789,6 +804,48 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
       // refresh positions after a brief delay so prices have a moment to update
       setTimeout(() => sendPositions(chatId).catch(() => {}), 1500);
     }
+    return;
+  }
+
+  if (data === "llm_toggle_entry") {
+    toggleConfigValue("LLM_ENTRY_ENABLED");
+    const now = CONFIG.LLM_ENTRY_ENABLED;
+    await tgPost("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      text: `LLM entry gate: ${now ? "🤖 ON" : "⚪️ OFF"}`,
+      show_alert: false,
+    });
+    await handleLlm(chatId, "");
+    return;
+  }
+
+  if (data === "llm_toggle_exit") {
+    toggleConfigValue("LLM_EXIT_ENABLED");
+    const now = CONFIG.LLM_EXIT_ENABLED;
+    await tgPost("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      text: `LLM exit advisor: ${now ? "🤖 ON" : "⚪️ OFF"}`,
+      show_alert: false,
+    });
+    await handleLlm(chatId, "");
+    return;
+  }
+
+  if (data === "llm_toggle_immediate") {
+    toggleConfigValue("LLM_EXIT_IMMEDIATE");
+    const now = CONFIG.LLM_EXIT_IMMEDIATE;
+    await tgPost("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      text: `Immediate exit: ${now ? "⚡ ON" : "⚪️ OFF"}`,
+      show_alert: false,
+    });
+    await handleLlm(chatId, "");
+    return;
+  }
+
+  if (data === "menu:llm") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+    await handleLlm(chatId, "");
     return;
   }
 
@@ -1719,24 +1776,78 @@ async function handleHistory(chatId: number, argText: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// /llm — quick toggle for LLM advisor.
+// /llm — toggle LLM exit advisor and/or entry gate.
+// /llm entry  → toggle entry gate
+// /llm exit   → toggle exit advisor
+// /llm (bare) → show status + inline buttons
 // ---------------------------------------------------------------------------
-async function handleLlm(chatId: number): Promise<void> {
-  const result = toggleConfigValue("LLM_EXIT_ENABLED");
-  if (result.ok === false) {
-    await tgPost("sendMessage", { chat_id: chatId, text: `❌ ${result.error}` });
+async function handleLlm(chatId: number, argText: string): Promise<void> {
+  const arg = argText.trim().toLowerCase();
+  const keySet = Boolean(CONFIG.LLM_API_KEY);
+
+  if (arg === "exit") {
+    const result = toggleConfigValue("LLM_EXIT_ENABLED");
+    if (result.ok === false) {
+      await tgPost("sendMessage", { chat_id: chatId, text: `❌ ${result.error}` });
+      return;
+    }
+    const now = CONFIG.LLM_EXIT_ENABLED;
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `🧠 LLM exit advisor: <b>${now ? "🤖 ON" : "⚪️ OFF"}</b>` +
+        (now && !keySet ? `\n⚠️ LLM_API_KEY is empty — LLM will skip every position.` : ""),
+      parse_mode: "HTML",
+    });
+    logger.info({ llm: now }, "[telegram] LLM exit toggled via /llm exit");
     return;
   }
-  const now = CONFIG.LLM_EXIT_ENABLED;
-  const keySet = Boolean(CONFIG.LLM_API_KEY);
+
+  if (arg === "entry") {
+    const result = toggleConfigValue("LLM_ENTRY_ENABLED");
+    if (result.ok === false) {
+      await tgPost("sendMessage", { chat_id: chatId, text: `❌ ${result.error}` });
+      return;
+    }
+    const now = CONFIG.LLM_ENTRY_ENABLED;
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text:
+        `🚪 LLM entry gate: <b>${now ? "🤖 ON" : "⚪️ OFF"}</b>` +
+        (now && !keySet ? `\n⚠️ LLM_API_KEY is empty — gate will always pass through.` : "") +
+        (now ? `\n\nSignals that pass existing filters are sent to the LLM before buying. Fail-open (6s timeout).` : ""),
+      parse_mode: "HTML",
+    });
+    logger.info({ llm: now }, "[telegram] LLM entry toggled via /llm entry");
+    return;
+  }
+
+  // Bare /llm — show status with toggle buttons
+  const exitOn = CONFIG.LLM_EXIT_ENABLED;
+  const entryOn = CONFIG.LLM_ENTRY_ENABLED;
+  const immediateOn = CONFIG.LLM_EXIT_IMMEDIATE;
   await tgPost("sendMessage", {
     chat_id: chatId,
-    text:
-      `🧠 LLM advisor: <b>${now ? "🤖 ON" : "⚪️ OFF"}</b>` +
-      (now && !keySet ? `\n⚠️ LLM_API_KEY is empty — LLM will skip every position.` : ""),
     parse_mode: "HTML",
+    text:
+      `🧠 <b>LLM modes</b>\n\n` +
+      `🚪 Entry gate:      <b>${entryOn ? "🤖 ON" : "⚪️ OFF"}</b>\n` +
+      `📤 Exit advisor:    <b>${exitOn ? "🤖 ON" : "⚪️ OFF"}</b>\n` +
+      `⚡ Immediate exit:  <b>${immediateOn ? "🤖 ON" : "⚪️ OFF"}</b>` +
+      (immediateOn ? `  <i>(LLM watches from entry, not just after arm)</i>` : "") + `\n` +
+      (!keySet ? `\n⚠️ LLM_API_KEY is not set.` : `\n✅ API key set · model: ${CONFIG.LLM_MODEL}`),
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: `${entryOn ? "🔴 Disable" : "🟢 Enable"} entry gate`, callback_data: "llm_toggle_entry" },
+          { text: `${exitOn ? "🔴 Disable" : "🟢 Enable"} exit advisor`, callback_data: "llm_toggle_exit" },
+        ],
+        [
+          { text: `${immediateOn ? "🔴 Disable" : "🟢 Enable"} immediate exit`, callback_data: "llm_toggle_immediate" },
+        ],
+      ],
+    },
   });
-  logger.info({ llm: now }, "[telegram] LLM toggled via /llm");
 }
 
 // ---------------------------------------------------------------------------
@@ -3433,7 +3544,7 @@ export function startTelegramBot(): () => void {
       { command: "history",   description: "Last N closed trades (default 10)" },
       { command: "settings",  description: "Edit trading params live (no restart)" },
       { command: "sources",   description: "Signal source mode + SCG/OKX/GMGN status" },
-      { command: "llm",       description: "Toggle the LLM exit advisor on/off" },
+      { command: "llm",       description: "LLM modes — toggle entry gate and/or exit advisor" },
       { command: "wss",       description: "OKX WSS status + open-position acceleration toggle" },
       { command: "pause",     description: "Stop taking new entry alerts" },
       { command: "resume",    description: "Resume taking new entry alerts" },
@@ -3528,7 +3639,7 @@ export function startTelegramBot(): () => void {
               case "/stats":        await handleStats(chatId); break;
               case "/mcapfilter":  await handleMcapFilter(chatId, argText); break;
               case "/history":   await handleHistory(chatId, argText); break;
-              case "/llm":       await handleLlm(chatId); break;
+              case "/llm":       await handleLlm(chatId, argText); break;
               case "/wss":       await handleWss(chatId); break;
               case "/pause":     await handlePause(chatId); break;
               case "/resume":    await handleResume(chatId); break;
